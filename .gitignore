@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!*.example
+runtime/
+artifacts/
+tools/
+NOTES.md
+*.sqlite
+*.sqlite-*
+*.md

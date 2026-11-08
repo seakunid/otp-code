@@ -1,0 +1,53 @@
+[
+  {
+    "id": "numeric-six-digits",
+    "from": "Secure Login <no-reply@example.test>",
+    "subject": "Your verification code",
+    "body": "Use 482913 to finish signing in. This code expires in 10 minutes. Never share it with anyone.",
+    "expected": {
+      "summary": "A six-digit sign-in code expires in 10 minutes.",
+      "otp": "482913"
+    }
+  },
+  {
+    "id": "four-digits-leading-zero",
+    "from": "CloudPay <security@example.test>",
+    "subject": "Confirm your CloudPay payment",
+    "body": "Your one-time passcode is 0738. Use it to approve your USD 24.90 payment for order 728194. This code expires in 5 minutes. Never share it with anyone, including support.",
+    "expected": {
+      "summary": "A four-digit payment code starts with zero and expires in 5 minutes; the order number is not the code.",
+      "otp": "0738"
+    }
+  },
+  {
+    "id": "hyphenated-alphanumeric",
+    "from": "Workspace Access <accounts@example.test>",
+    "subject": "Sign-in code for Workspace",
+    "body": "Enter the code A7K-92Q in the Workspace sign-in window. The code can be used once and expires after 15 minutes. You may enter it without the hyphen.",
+    "expected": {
+      "summary": "A one-time alphanumeric sign-in code is formatted with a hyphen and expires in 15 minutes.",
+      "otp": "A7K92Q"
+    }
+  },
+  {
+    "id": "html-separated-digits",
+    "from": "Travel Portal <verify@example.test>",
+    "subject": "Verify your new device",
+    "body": "Your verification code: 6 3 9 2 0 4\n\nUse this code within 10 minutes to verify the new device. If you did not request this, secure your account.",
+    "html": "<!doctype html><html><body><h1>Verify your new device</h1><p>Your verification code:</p><table role=\"presentation\"><tr><td>6</td><td>3</td><td>9</td><td>2</td><td>0</td><td>4</td></tr></table><p>Use this code within 10 minutes to verify the new device.</p><p>If you did not request this, secure your account.</p></body></html>",
+    "expected": {
+      "summary": "A six-digit new-device code is split across HTML cells and expires in 10 minutes.",
+      "otp": "639204"
+    }
+  },
+  {
+    "id": "eight-digits-in-subject-with-previous-code",
+    "from": "Account Security <security@example.test>",
+    "subject": "80427516 is your Account Security verification code",
+    "body": "Your new verification code is 80427516. Enter it within 10 minutes to finish signing in. Only the most recent code will work.\n\n----- Previous message -----\nYour verification code was 11111111. This previous code has expired.",
+    "expected": {
+      "summary": "The current eight-digit code appears in subject and body, expires in 10 minutes, and replaces an expired quoted code.",
+      "otp": "80427516"
+    }
+  }
+]

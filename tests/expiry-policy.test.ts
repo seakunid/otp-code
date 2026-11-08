@@ -1,0 +1,18 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {randomBytes} from 'node:crypto';import {resolve} from 'node:path';import {Store} from '../src/store.js';import {Retrieval} from '../src/service.js';import {ruleSchema,lookupSchema} from '../src/contracts.js';
+for(const scenario of ['email-earlier','policy-earlier','no-expiry','expired','future-receipt'] as const)test('receipt and expiry policy: '+scenario,async()=>{
+ const store=new Store(':memory:',randomBytes(32)),now=Math.floor(Date.now()/1000),p=store.createProfile('target@example.test',resolve('expiry-'+scenario));store.enable(p.uid);
+ const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'exact',subject:'code',purposeMarkers:['sign-in code'],pattern:'code is (?<otp>[0-9]{6})'});store.syncRule(rule);store.activate('p','LOGIN',1);
+ const receivedAt=now-10,expiresAt=scenario==='email-earlier'?now+20:scenario==='policy-earlier'?now+200:scenario==='expired'?now-1:undefined;
+ let reads=0;const service=new Retrieval(store,{read:async()=>{reads++;if(scenario==='future-receipt'&&reads>1)throw Error('FUTURE_MESSAGE_REJECTED');return[{ref:'source',sender:'sender@example.test',subject:'code',body:'Your sign-in code is 001234',receivedAt:scenario==='future-receipt'?now+60:receivedAt,expiresAt}];},close:async()=>{}},undefined,1);
+ const input=lookupSchema.parse({requestUid:'r',attemptUid:'a',providerUid:'p',accountUid:'c',targetEmail:p.email,purpose:'LOGIN',ruleVersion:1,windowStartedAt:now-60,lookupDeadlineAt:now+30,...(scenario==='no-expiry'?{}:{otpValiditySeconds:100})});
+ try{if(scenario==='no-expiry')await assert.rejects(service.lookup(input),/EXPIRY_UNAVAILABLE/);else if(scenario==='expired')await assert.rejects(service.lookup(input),/OTP_EXPIRED/);else if(scenario==='future-receipt')await assert.rejects(service.lookup(input),/FUTURE_MESSAGE_REJECTED/);else{const result=await service.lookup(input) as {expiresAt:number;expirySource:string;code:string};assert.equal(result.expiresAt,scenario==='email-earlier'?now+20:receivedAt+100);assert.equal(result.expirySource,scenario==='email-earlier'?'EMAIL':'PROVIDER_POLICY');assert.equal(result.code,'001234');}}finally{await service.shutdown();store.close();}
+});
+test('code expiring during verified browser closure cannot escape as FOUND or replay',async(t)=>{
+ const now=Date.now();t.mock.timers.enable({apis:['Date'],now});
+ const store=new Store(':memory:',randomBytes(32)),p=store.createProfile('target@example.test',resolve('expiry-during-close'));store.enable(p.uid);
+ const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'exact',subject:'code',purposeMarkers:['sign-in code'],pattern:'code is (?<otp>[0-9]{6})'});store.syncRule(rule);store.activate('p','LOGIN',1);
+ const seconds=Math.floor(now/1000);let reads=0,closes=0;
+ const service=new Retrieval(store,{read:async()=>{reads++;return[{ref:'source',sender:'sender@example.test',subject:'code',body:'Your sign-in code is 001234',receivedAt:seconds,expiresAt:seconds+1}];},close:async()=>{closes++;t.mock.timers.tick(2000);}});
+ const input=lookupSchema.parse({requestUid:'r',attemptUid:'a',providerUid:'p',accountUid:'c',targetEmail:p.email,purpose:'LOGIN',ruleVersion:1,windowStartedAt:seconds-1,lookupDeadlineAt:seconds+30,otpValiditySeconds:100});
+ try{await assert.rejects(service.lookup(input),/OTP_EXPIRED/);assert.equal(store.read('a').code,undefined);await assert.rejects(service.lookup(input),/OTP_EXPIRED/);assert.equal(reads,1);assert.equal(closes,1);}finally{await service.shutdown();store.close();}
+});

@@ -1,0 +1,35 @@
+{
+  "name": "otp-retrieval-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "node --import tsx src/server.ts",
+    "start": "node --env-file-if-exists=.env dist/src/server.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "lint": "npm run build --silent && eslint dist/src dist/scripts dist/tests",
+    "config:check": "node --import tsx scripts/config-check.ts",
+    "test:scale:profiles": "node --import tsx tests/scale.test.ts",
+    "profiles:import": "node --env-file-if-exists=.env --import tsx scripts/import-profiles.ts",
+    "test:http": "node --import tsx --test tests/core.test.ts tests/reliability.test.ts tests/selection.test.ts",
+    "test:e2e:gmail": "node --env-file-if-exists=.env --import tsx scripts/gmail-e2e.ts",
+    "test:e2e:reliability": "node --env-file-if-exists=.env --import tsx scripts/gmail-reliability.ts"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "puppeteer-core": "25.16.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.10.1",
+    "eslint": "^9.39.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
