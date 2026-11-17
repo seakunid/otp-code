@@ -69,15 +69,29 @@ export class Gmail implements Mailbox {
       const query=`-in:spam -in:trash -in:drafts after:${input.windowStartedAt} before:${Math.floor(Date.now()/1000)+1} {${senders.join(' ')}} subject:${quote(rule.subject)}`;
       const search=async()=>{
         stage='search';log('debug','gmail_stage_started',{stage,remainingMs:Math.max(0,deadline-Date.now())});await page.goto(`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
-        await page.waitForFunction((subject)=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).length>0&&[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).every(e=>(e.querySelector('.bog')?.textContent||'').includes(subject))||/No conversations found|No results found|No messages matched your search/.test(document.body.innerText),{polling:100},rule.subject);
+        // shortcut: Gmail renders its empty state in the account language; td.TC is the locale-independent empty marker (absent while loading)
+        await page.waitForFunction((subject)=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).length>0&&[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).every(e=>(e.querySelector('.bog')?.textContent||'').includes(subject))||[...document.querySelectorAll('td.TC')].some(e=>e.getBoundingClientRect().height>0),{polling:100},rule.subject);
       };
       await search();
-      const coverage=await page.evaluate(()=>{
-        const older=[...document.querySelectorAll('[aria-label="Older"],[aria-label="Next results"]')].find(e=>e.getBoundingClientRect().height>0);
-        return older?{complete:older.getAttribute('aria-disabled')==='true',range:older.parentElement?.textContent?.match(/([0-9,]+)[–-]([0-9,]+) of ([0-9,]+)/)?.slice(1).map(x=>Number(x.replace(/,/g,'')))}:null;
-      });
+      // shortcut: Gmail renders the result count as span.Dj now and the pager arrows carry no aria-label, so completeness is read from the count; the count renders a moment after the rows and briefly still shows the previous list.
+      const coverage=await(async()=>{
+        const until=Math.min(Date.now()+10000,deadline);
+        for(;;){
+          const state=await page.evaluate(()=>({
+            rows:[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).length,
+            counts:[...((([...document.querySelectorAll('span.Dj')].filter(e=>e.getBoundingClientRect().height>0).at(-1)?.textContent)||'').matchAll(/([0-9][0-9,]*)/g))].map(m=>Number(m[1].replace(/,/g,''))),
+            older:!![...document.querySelectorAll('[aria-label="Older"],[aria-label="Next results"],[aria-label="Lebih lama"]')].find(e=>e.getBoundingClientRect().height>0),
+            empty:!![...document.querySelectorAll('td.TC')].find(e=>e.getBoundingClientRect().height>0)
+          }));
+          if(state.rows===0&&state.empty)return null;
+          if(state.rows>0&&state.counts.length>=3&&state.counts[0]===1&&state.counts[1]===state.rows)return{complete:state.counts[1]===state.counts[2],range:state.counts.slice(0,3)};
+          if(state.rows>0&&state.older)return{complete:false,range:undefined};
+          if(Date.now()>=until){log('warn','gmail_coverage_unreadable',{rows:state.rows,counts:state.counts.join(','),older:state.older});return null;}
+          await new Promise(resolve=>setTimeout(resolve,100));
+        }
+      })();
       const refs=await page.evaluate(()=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).map(e=>e.getAttribute('data-legacy-thread-id')||e.querySelector('[data-legacy-thread-id]')?.getAttribute('data-legacy-thread-id')).filter((x):x is string=>Boolean(x)));
-      log('info','gmail_search_completed',{profileUid:profile.uid,threadCount:refs.length,coverageComplete:!!coverage?.complete});
+      log('info','gmail_search_completed',{profileUid:profile.uid,threadCount:refs.length,coverageComplete:!!coverage?.complete,coverageRange:coverage?.range?.join('-')});
       if(refs.length>20||(refs.length>0&&(!coverage?.complete||!coverage.range||coverage.range[0]!==1||coverage.range[1]!==refs.length||coverage.range[2]!==refs.length)))throw new ServiceError(422,'SEARCH_COVERAGE_INCOMPLETE');
       const messages:Message[]=[];
       for(const ref of refs){
@@ -92,7 +106,8 @@ export class Gmail implements Mailbox {
         if(!clicked)throw new ServiceError(502,'GMAIL_THREAD_NOT_FOUND');
         await page.waitForSelector('.a3s',{visible:true});
         await page.evaluate(()=>{for(const e of document.querySelectorAll<HTMLElement>('.ajR'))if((e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0))e.click();});
-        if(await page.$('.a3s a[href*=\"view=lg\"]'))throw new ServiceError(422,'MESSAGE_CLIPPED');
+        // The provider template exceeds Gmail's render limit; the code always sits above the clip, and a hidden tail can only lose a capture, never invent one.
+        if(await page.$('.a3s a[href*="view=lg"]'))log('warn','gmail_message_clipped',{profileUid:profile.uid,threadIndex:refs.indexOf(ref)+1});
         const rows=await page.evaluate(()=>{
           const subject=document.querySelector('h2.hP')?.textContent?.trim()||'';
           return [...document.querySelectorAll('.adn')].filter(e=>e.querySelector('.a3s')).map(e=>({
@@ -106,9 +121,10 @@ export class Gmail implements Mailbox {
           if(!row.id||!/^[a-f0-9]+$/i.test(row.id))throw new ServiceError(502,'MESSAGE_METADATA_UNVERIFIED');
           const popup=new Promise<Page|null>(resolve=>page.once('popup',resolve));
           stage='original_menu';log('debug','gmail_stage_started',{stage});
-          await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"]`);
+          // shortcut: the menu is localized; button.Wsq5Cf and a label list cover current en/id UI, add locales when a profile uses one
+          await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"],[data-legacy-message-id="${row.id}"] button[aria-label="Opsi pesan lainnya"],[data-legacy-message-id="${row.id}"] button.Wsq5Cf`);
           await page.waitForFunction(()=>{
-            const item=[...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)&&e.textContent?.trim()==='Show original');
+            const item=[...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)&&/^(?:show original|tampilkan versi asli|tampilkan aslinya)$/i.test(e.textContent?.trim()||''));
             if(!item)return false;item.click();return true;
           },{polling:100});
           let popupTimer:NodeJS.Timeout|undefined;

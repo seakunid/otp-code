@@ -26,7 +26,7 @@ export async function extract(rule:Rule,message:Message) {
   // Quoted/replaced mail is never a fallback source for the current code.
   const body=message.body.split(/----- (?:Previous|Original) message -----|\nOn .+wrote:|\n>/i)[0];
   // OpenAI's login code emails carry a "not trying to reset your password" boilerplate line; without stripping it the LOGIN purpose guard rejects them.
-  const context=`${message.subject}\n${body}`.toLowerCase().replace(/please ignore this email if you (?:weren[’']t|didn[’']t|did not) trying to reset your password/,'');
+  const context=`${message.subject}\n${body}`.toLowerCase().replace(/please ignore this email if you (?:weren[’']t|didn[’']t|did not) trying to reset your password/,'').replace(/if you (?:were not|weren[’']t|did not|didn[’']t) (?:trying to )?(?:log ?in|sign ?in)[\s\S]{0,120}?please (?:reset your password|ignore this email)/g,'');
   if(/suspicious (?:sign.?in|activity)|security alert|recovery code|backup code/i.test(context)){decision('SECURITY_ALERT','SECURITY_MARKER');return {outcome:'SECURITY_ALERT' as const};}
   const conflicting=rule.purpose==='LOGIN'?/password reset|reset (?:your )?password|payment|transaction|purchase/i:rule.purpose==='PAYMENT'?/password reset|reset (?:your )?password|sign.?in|log.?in/i:/payment|transaction|purchase|sign.?in|log.?in/i;
   if(conflicting.test(context)){decision('NOT_FOUND','PURPOSE_CONFLICT');return {outcome:'NOT_FOUND' as const};}
