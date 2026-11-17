@@ -6,6 +6,7 @@ import {canonicalDirectory} from './store.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {ProfileLease} from './profile-lease.js';
+import {log,errorFields} from './log.js';
 export interface Mailbox { read(profile:Profile,input:Lookup,rule:Rule,signal:AbortSignal):Promise<Message[]>; close(profile:Profile):Promise<void>; setup?(profile:Profile,deadline:number,signal?:AbortSignal):Promise<void>; }
 export class Gmail implements Mailbox {
   private sessions=new Map<string,Browser>();
@@ -15,11 +16,12 @@ export class Gmail implements Mailbox {
   async open(profile:Profile,deadline:number){
     if(!existsSync(profile.directory))throw new ServiceError(503,'PROFILE_DIRECTORY_MISSING');
     if(process.platform==='win32'&&canonicalDirectory(realpathSync(profile.directory))!==canonicalDirectory(profile.directory))throw new ServiceError(503,'PROFILE_PATH_CHANGED');
-    let browser=this.sessions.get(profile.uid);if(browser?.connected)return browser;
+    let browser=this.sessions.get(profile.uid);if(browser?.connected){log('debug','browser_reused',{profileUid:profile.uid});return browser;}
+    const started=performance.now();log('info','browser_launch_started',{profileUid:profile.uid});
     this.leases.acquire(profile.directory);
     try{browser=await puppeteer.launch({executablePath:this.executablePath,userDataDir:profile.directory,headless:false,pipe:true,defaultViewport:{width:1365,height:900},timeout:Math.max(1,Math.min(20000,deadline-Date.now())),protocolTimeout:Math.max(1,Math.min(15000,deadline-Date.now())),args:['--no-first-run','--no-default-browser-check','--lang=en-US',`--otp-retrieval-owned=${profile.uid}`]});}
-    catch(error){try{await this.recover(profile);}catch{this.tainted.add(profile.uid);throw new ServiceError(503,'PROFILE_CLEANUP_FAILED');}throw error;}
-    this.sessions.set(profile.uid,browser);return browser;
+    catch(error){log('error','browser_launch_failed',{profileUid:profile.uid,...errorFields(error)});try{await this.recover(profile);}catch{this.tainted.add(profile.uid);throw new ServiceError(503,'PROFILE_CLEANUP_FAILED');}throw error;}
+    this.sessions.set(profile.uid,browser);log('info','browser_launch_completed',{profileUid:profile.uid,pid:browser.process()?.pid,durationMs:Math.round(performance.now()-started)});return browser;
   }
   async verify(page:Page,email:string,deadline:number){
     await page.bringToFront();
@@ -29,7 +31,7 @@ export class Gmail implements Mailbox {
         await page.goto('https://mail.google.com/mail/u/0/#inbox',{waitUntil:'domcontentloaded',timeout});
         await page.waitForFunction(()=>/[^\s<>]+@[^\s<>]+ - Gmail$/.test(document.title)||location.hostname==='accounts.google.com',{polling:100,timeout:Math.max(1,Math.min(15000,deadline-Date.now()))});
         break;
-      }catch{await page.goto('about:blank',{waitUntil:'load',timeout:Math.max(1,Math.min(3000,deadline-Date.now()))}).catch(()=>{});}
+      }catch(error){log('warn','gmail_identity_retry',{retry:attempt+1,remainingMs:Math.max(0,deadline-Date.now()),...errorFields(error)});await page.goto('about:blank',{waitUntil:'load',timeout:Math.max(1,Math.min(3000,deadline-Date.now()))}).catch(()=>{});}
     }
     if(page.url()==='about:blank')throw new ServiceError(502,'GMAIL_UI_TIMEOUT_IDENTITY');
     if(!page.url().startsWith('https://mail.google.com/'))throw new ServiceError(503,'LOGIN_REQUIRED');
@@ -47,7 +49,8 @@ export class Gmail implements Mailbox {
     throw new ServiceError(504,'MANUAL_LOGIN_TIMEOUT');
   }
   async read(profile:Profile,input:Lookup,rule:Rule,signal:AbortSignal):Promise<Message[]> {
-    let stage='open';
+    let stage='open';const started=performance.now();
+    log('debug','gmail_read_started',{profileUid:profile.uid,attemptUid:input.attemptUid});
     const deadline=input.lookupDeadlineAt*1000-5000;signal.throwIfAborted();if(Date.now()>=deadline)throw new ServiceError(504,'TIMEOUT');let browser=await this.open(profile,deadline);
     let page=await browser.newPage();page.setDefaultTimeout(Math.max(1,Math.min(15000,deadline-Date.now())));
     const abort=()=>{void page.close().catch(()=>{});};signal.addEventListener('abort',abort,{once:true});
@@ -55,25 +58,37 @@ export class Gmail implements Mailbox {
       stage='identity';
       try{await this.verify(page,profile.email,Math.min(deadline,Date.now()+15000));}catch(error){
         if(error instanceof ServiceError&&error.code==='GMAIL_UI_TIMEOUT_IDENTITY'&&Date.now()<deadline){
+          log('warn','gmail_browser_restart',{profileUid:profile.uid,reason:'IDENTITY_TIMEOUT'});
           await page.close().catch(()=>{});await this.close(profile);browser=await this.open(profile,deadline);page=await browser.newPage();page.setDefaultTimeout(Math.max(1,Math.min(15000,deadline-Date.now())));await this.verify(page,profile.email,deadline);
         }else throw error;
       }
+      log('debug','gmail_identity_verified',{profileUid:profile.uid});
       const quote=(x:string)=>`"${x.replace(/["\\\r\n]/g,' ')}"`;
       const senders=[...rule.senders,...rule.domains.map(x=>`@${x}`)].map(x=>`from:${quote(x)}`);
       const query=`-in:spam -in:trash -in:drafts after:${input.windowStartedAt} before:${Math.floor(Date.now()/1000)+1} {${senders.join(' ')}} subject:${quote(rule.subject)}`;
-      stage='search';await page.goto(`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
-      await page.waitForFunction((subject)=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).length>0&&[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).every(e=>(e.querySelector('.bog')?.textContent||'').includes(subject))||/No conversations found|No results found|No messages matched your search/.test(document.body.innerText),{polling:100},rule.subject);
+      const search=async()=>{
+        stage='search';log('debug','gmail_stage_started',{stage,remainingMs:Math.max(0,deadline-Date.now())});await page.goto(`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
+        await page.waitForFunction((subject)=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).length>0&&[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).every(e=>(e.querySelector('.bog')?.textContent||'').includes(subject))||/No conversations found|No results found|No messages matched your search/.test(document.body.innerText),{polling:100},rule.subject);
+      };
+      await search();
       const coverage=await page.evaluate(()=>{
         const older=[...document.querySelectorAll('[aria-label="Older"],[aria-label="Next results"]')].find(e=>e.getBoundingClientRect().height>0);
         return older?{complete:older.getAttribute('aria-disabled')==='true',range:older.parentElement?.textContent?.match(/([0-9,]+)[–-]([0-9,]+) of ([0-9,]+)/)?.slice(1).map(x=>Number(x.replace(/,/g,'')))}:null;
       });
       const refs=await page.evaluate(()=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).map(e=>e.getAttribute('data-legacy-thread-id')||e.querySelector('[data-legacy-thread-id]')?.getAttribute('data-legacy-thread-id')).filter((x):x is string=>Boolean(x)));
+      log('info','gmail_search_completed',{profileUid:profile.uid,threadCount:refs.length,coverageComplete:!!coverage?.complete});
       if(refs.length>20||(refs.length>0&&(!coverage?.complete||!coverage.range||coverage.range[0]!==1||coverage.range[1]!==refs.length||coverage.range[2]!==refs.length)))throw new ServiceError(422,'SEARCH_COVERAGE_INCOMPLETE');
       const messages:Message[]=[];
       for(const ref of refs){
         signal.throwIfAborted();if(Date.now()>=deadline-5000)throw new ServiceError(504,'TIMEOUT');
         if(!/^[a-f0-9]+$/i.test(ref))throw new ServiceError(502,'GMAIL_UI_CHANGED');
-        stage='message';await page.goto(`https://mail.google.com/mail/u/0/#all/${ref}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
+        await search();
+        stage='message';log('debug','gmail_stage_started',{stage,threadIndex:refs.indexOf(ref)+1});
+        const clicked=await page.evaluate((threadRef)=>{
+          const row=[...document.querySelectorAll<HTMLElement>('tr.zA')].find(e=>e.getBoundingClientRect().height>0&&(e.getAttribute('data-legacy-thread-id')===threadRef||e.querySelector('[data-legacy-thread-id]')?.getAttribute('data-legacy-thread-id')===threadRef));
+          if(!row)return false;row.click();return true;
+        },ref);
+        if(!clicked)throw new ServiceError(502,'GMAIL_THREAD_NOT_FOUND');
         await page.waitForSelector('.a3s',{visible:true});
         await page.evaluate(()=>{for(const e of document.querySelectorAll<HTMLElement>('.ajR'))if((e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0))e.click();});
         if(await page.$('.a3s a[href*=\"view=lg\"]'))throw new ServiceError(422,'MESSAGE_CLIPPED');
@@ -89,7 +104,7 @@ export class Gmail implements Mailbox {
         for(const row of rows){
           if(!row.id||!/^[a-f0-9]+$/i.test(row.id))throw new ServiceError(502,'MESSAGE_METADATA_UNVERIFIED');
           const popup=new Promise<Page|null>(resolve=>page.once('popup',resolve));
-          stage='original_menu';
+          stage='original_menu';log('debug','gmail_stage_started',{stage});
           await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"]`);
           await page.waitForFunction(()=>{
             const item=[...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)&&e.textContent?.trim()==='Show original');
@@ -100,35 +115,44 @@ export class Gmail implements Mailbox {
           if(!original)throw new ServiceError(502,'GMAIL_UI_CHANGED');
           const abortOriginal=()=>{void original.close().catch(()=>{});};signal.addEventListener('abort',abortOriginal,{once:true});
           try{
-            stage='original_headers';
+            stage='original_headers';log('debug','gmail_stage_started',{stage});
             await original.waitForFunction(()=>[...document.querySelectorAll('pre')].some(e=>/Delivered-To:/.test(e.textContent||'')&&/Message-ID:/i.test(e.textContent||'')&&/\n\s*\n/.test(e.textContent||'')),{polling:100,timeout:Math.max(1,deadline-Date.now())});
             const raw=await original.evaluate(()=>[...document.querySelectorAll('pre')].map(e=>e.textContent||'').find(text=>/Delivered-To:|Received:/.test(text))?.slice(0,65536)||'');
             const metadata=receiptMetadata(raw,profile.email,row.sender);
+            log('debug','gmail_message_verified',{recipientMatched:!!metadata,receivedAt:metadata?.receivedAt});
             if(metadata&&!metadata.subject)throw new ServiceError(502,'MESSAGE_SUBJECT_UNVERIFIED');
             // Replies can have a different Subject from Gmail's conversation heading.
             if(metadata)messages.push({...metadata,sender:row.sender,subject:metadata.subject!,body:row.body,expiresAt:messageExpiry(row.body,metadata.receivedAt)});
           }finally{signal.removeEventListener('abort',abortOriginal);await original.close().catch(()=>{});}
         }
       }
+      log('info','gmail_read_completed',{profileUid:profile.uid,messageCount:messages.length,durationMs:Math.round(performance.now()-started)});
       return messages.sort((a,b)=>b.receivedAt-a.receivedAt);
     }catch(error){
+      log('warn','gmail_read_failed',{profileUid:profile.uid,stage,remainingMs:Math.max(0,deadline-Date.now()),...errorFields(error)});
       if(Date.now()>=deadline)throw new ServiceError(504,'TIMEOUT');
       if(error instanceof ServiceError||signal.aborted)throw error;
-      console.error(JSON.stringify({event:'gmail_ui_failure',stage,remainingMs:deadline-Date.now(),...(await page.evaluate((email)=>({gmailHost:location.hostname==='mail.google.com',gmailTitle:document.title.includes('Gmail'),accountMatches:document.title.includes(email),compose:!!document.querySelector('[gh="cm"]'),ready:document.readyState}),profile.email).catch(()=>({pageUnavailable:true})))}));
+      log('error','gmail_ui_failure',{stage,remainingMs:Math.max(0,deadline-Date.now()),...(await page.evaluate((email)=>({gmailHost:location.hostname==='mail.google.com',gmailTitle:document.title.includes('Gmail'),accountMatches:document.title.includes(email),compose:!!document.querySelector('[gh="cm"]'),ready:document.readyState}),profile.email).catch(()=>({pageUnavailable:true})))});
       throw new ServiceError(502,((error as Error).name==='TimeoutError'?'GMAIL_UI_TIMEOUT_':'GMAIL_UI_CHANGED_')+stage.toUpperCase());
     }finally{signal.removeEventListener('abort',abort);await page.close().catch(()=>{});}
   }
   async close(profile:Profile){
     const browser=this.sessions.get(profile.uid);if(!browser){if(this.tainted.has(profile.uid))throw new ServiceError(503,'PROFILE_CLEANUP_FAILED');return;}
+    const started=performance.now();log('info','browser_close_started',{profileUid:profile.uid});
     const child=browser.process();let timer:NodeJS.Timeout|undefined;
     try {
       if(child?.pid&&process.platform==='win32')await this.processTree(child.pid,false);
-      await Promise.race([browser.close(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ServiceError(503,'PROFILE_CLEANUP_FAILED')),5000);})]);
+      try{await Promise.race([browser.close(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ServiceError(503,'PROFILE_CLEANUP_FAILED')),5000);})]);}
+      catch(error){
+        // Chrome already exited (user closed it or it crashed), so the pipe is gone; nothing left to clean up.
+        if(!child||(child.exitCode===null&&child.signalCode===null))throw error;
+        log('warn','browser_close_skipped',{profileUid:profile.uid,...errorFields(error)});
+      }
       if(child&&child.exitCode===null&&child.signalCode===null)await new Promise<void>((resolve,reject)=>{const t=setTimeout(()=>reject(new ServiceError(503,'PROFILE_CLEANUP_FAILED')),2000);child.once('exit',()=>{clearTimeout(t);resolve();});});
       if(child?.pid&&process.platform==='win32')await this.processTree(child.pid,true);
       this.sessions.delete(profile.uid);
-      this.leases.release(profile.directory);
-    }finally{clearTimeout(timer);}
+      this.leases.release(profile.directory);log('info','browser_close_completed',{profileUid:profile.uid,durationMs:Math.round(performance.now()-started)});
+    }catch(error){log('error','browser_close_failed',{profileUid:profile.uid,...errorFields(error)});throw error;}finally{clearTimeout(timer);}
   }
   private trees=new Map<number,string>();
   private async processTree(pid:number,verify:boolean){
@@ -139,11 +163,13 @@ export class Gmail implements Mailbox {
     if(verify)this.trees.delete(pid);else this.trees.set(pid,Buffer.from(result.stdout.trim()).toString('base64'));
   }
   async recover(profile:Profile){
+    log('info','browser_recovery_started',{profileUid:profile.uid});
     if(process.platform!=='win32')throw new ServiceError(503,'RECOVERY_REQUIRES_WINDOWS');
     const lease=this.leases.recoverable(profile.directory);
     const encoded=Buffer.from(JSON.stringify({directory:profile.directory,marker:`--otp-retrieval-owned=${profile.uid}`})).toString('base64');
     const script=`$ErrorActionPreference='Stop'; $v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'))|ConvertFrom-Json; $items=Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"|Where-Object {$_.CommandLine -and $_.CommandLine.Contains($v.directory) -and $_.CommandLine.Contains($v.marker) -and $_.CommandLine -notmatch '--type='};foreach($item in $items){$p=Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue;if($p){[void]$p.CloseMainWindow();if(!$p.WaitForExit(7000)){throw 'PROFILE_CLEANUP_FAILED'}}}`;
     await promisify(execFile)('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{timeout:10000,windowsHide:true,maxBuffer:1024});
     if(lease)this.leases.recovered(profile.directory);
+    log('info','browser_recovery_completed',{profileUid:profile.uid,leaseRecovered:lease});
   }
 }
