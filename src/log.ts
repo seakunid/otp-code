@@ -29,5 +29,6 @@ export function errorFields(error:unknown){
     'Invalid browser capacity':'INVALID_BROWSER_CAPACITY',
     'STATE_KEY_INVALID':'STATE_KEY_INVALID','RECOVERY_PROFILE_MISSING':'RECOVERY_PROFILE_MISSING'
   };
-  return {...type,errorCode:error instanceof Error&&Object.hasOwn(configuration,error.message)?configuration[error.message]:'INTERNAL_ERROR'};
+  // Without the message an unexpected failure is undiagnosable; log() still redacts addresses and truncates.
+  return {...type,errorCode:error instanceof Error&&Object.hasOwn(configuration,error.message)?configuration[error.message]:'INTERNAL_ERROR',...(error instanceof Error?{errorMessage:error.message}:{})};
 }

@@ -19,10 +19,19 @@ export class Gmail implements Mailbox {
     let browser=this.sessions.get(profile.uid);if(browser?.connected){log('debug','browser_reused',{profileUid:profile.uid});return browser;}
     const started=performance.now();log('info','browser_launch_started',{profileUid:profile.uid});
     this.leases.acquire(profile.directory);
-    // Google refuses sign-in from browsers flagged as automated; the manual login window must keep its normal browser identity.
-    try{browser=await puppeteer.launch({executablePath:this.executablePath,userDataDir:profile.directory,headless:false,pipe:true,ignoreDefaultArgs:['--enable-automation'],defaultViewport:{width:1365,height:900},timeout:Math.max(1,Math.min(20000,deadline-Date.now())),protocolTimeout:Math.max(1,Math.min(15000,deadline-Date.now())),args:['--no-first-run','--no-default-browser-check','--lang=en-US','--disable-blink-features=AutomationControlled',`--otp-retrieval-owned=${profile.uid}`]});}
-    catch(error){log('error','browser_launch_failed',{profileUid:profile.uid,...errorFields(error)});try{await this.recover(profile);}catch{this.tainted.add(profile.uid);throw new ServiceError(503,'PROFILE_CLEANUP_FAILED');}throw error;}
+    try{browser=await this.launch(profile,deadline);}
+    catch(error){
+      log('error','browser_launch_failed',{profileUid:profile.uid,...errorFields(error)});
+      try{await this.recover(profile);}catch{this.tainted.add(profile.uid);throw new ServiceError(503,'PROFILE_CLEANUP_FAILED');}
+      // A crashed or foreign Chrome still holding the profile directory is the usual cause, and recovery clears it, so one retry wins.
+      try{browser=await this.launch(profile,deadline);}
+      catch(retryError){log('error','browser_launch_failed_after_recovery',{profileUid:profile.uid,...errorFields(retryError)});throw new ServiceError(503,'BROWSER_LAUNCH_FAILED');}
+    }
     this.sessions.set(profile.uid,browser);log('info','browser_launch_completed',{profileUid:profile.uid,pid:browser.process()?.pid,durationMs:Math.round(performance.now()-started)});return browser;
+  }
+  // Google refuses sign-in from browsers flagged as automated; the manual login window must keep its normal browser identity.
+  private launch(profile:Profile,deadline:number){
+    return puppeteer.launch({executablePath:this.executablePath,userDataDir:profile.directory,headless:false,pipe:true,ignoreDefaultArgs:['--enable-automation'],defaultViewport:{width:1365,height:900},timeout:Math.max(1,Math.min(20000,deadline-Date.now())),protocolTimeout:Math.max(1,Math.min(15000,deadline-Date.now())),args:['--no-first-run','--no-default-browser-check','--lang=en-US','--disable-blink-features=AutomationControlled',`--otp-retrieval-owned=${profile.uid}`]});
   }
   async verify(page:Page,email:string,deadline:number){
     await page.bringToFront();
@@ -183,8 +192,9 @@ export class Gmail implements Mailbox {
     log('info','browser_recovery_started',{profileUid:profile.uid});
     if(process.platform!=='win32')throw new ServiceError(503,'RECOVERY_REQUIRES_WINDOWS');
     const lease=this.leases.recoverable(profile.directory);
-    const encoded=Buffer.from(JSON.stringify({directory:profile.directory,marker:`--otp-retrieval-owned=${profile.uid}`})).toString('base64');
-    const script=`$ErrorActionPreference='Stop'; $v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'))|ConvertFrom-Json; $items=Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"|Where-Object {$_.CommandLine -and $_.CommandLine.Contains($v.directory) -and $_.CommandLine.Contains($v.marker) -and $_.CommandLine -notmatch '--type='};foreach($item in $items){$p=Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue;if($p){[void]$p.CloseMainWindow();if(!$p.WaitForExit(7000)){throw 'PROFILE_CLEANUP_FAILED'}}}`;
+    const encoded=Buffer.from(JSON.stringify({directory:profile.directory})).toString('base64');
+    // The directory belongs to this profile, so whatever Chrome holds it is a leftover; the previous ownership marker is not trustworthy after a crash.
+    const script=`$ErrorActionPreference='Stop'; $v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'))|ConvertFrom-Json; $items=Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"|Where-Object {$_.CommandLine -and $_.CommandLine.Contains($v.directory) -and $_.CommandLine -notmatch '--type='};foreach($item in $items){$p=Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue;if($p){[void]$p.CloseMainWindow();if(!$p.WaitForExit(5000)){Stop-Process -Id $item.ProcessId -Force;if(!$p.WaitForExit(3000)){throw 'PROFILE_CLEANUP_FAILED'}}}}`;
     await promisify(execFile)('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{timeout:10000,windowsHide:true,maxBuffer:1024});
     if(lease)this.leases.recovered(profile.directory);
     log('info','browser_recovery_completed',{profileUid:profile.uid,leaseRecovered:lease});
