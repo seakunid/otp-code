@@ -19,7 +19,8 @@ export class Gmail implements Mailbox {
     let browser=this.sessions.get(profile.uid);if(browser?.connected){log('debug','browser_reused',{profileUid:profile.uid});return browser;}
     const started=performance.now();log('info','browser_launch_started',{profileUid:profile.uid});
     this.leases.acquire(profile.directory);
-    try{browser=await puppeteer.launch({executablePath:this.executablePath,userDataDir:profile.directory,headless:false,pipe:true,defaultViewport:{width:1365,height:900},timeout:Math.max(1,Math.min(20000,deadline-Date.now())),protocolTimeout:Math.max(1,Math.min(15000,deadline-Date.now())),args:['--no-first-run','--no-default-browser-check','--lang=en-US',`--otp-retrieval-owned=${profile.uid}`]});}
+    // Google refuses sign-in from browsers flagged as automated; the manual login window must keep its normal browser identity.
+    try{browser=await puppeteer.launch({executablePath:this.executablePath,userDataDir:profile.directory,headless:false,pipe:true,ignoreDefaultArgs:['--enable-automation'],defaultViewport:{width:1365,height:900},timeout:Math.max(1,Math.min(20000,deadline-Date.now())),protocolTimeout:Math.max(1,Math.min(15000,deadline-Date.now())),args:['--no-first-run','--no-default-browser-check','--lang=en-US','--disable-blink-features=AutomationControlled',`--otp-retrieval-owned=${profile.uid}`]});}
     catch(error){log('error','browser_launch_failed',{profileUid:profile.uid,...errorFields(error)});try{await this.recover(profile);}catch{this.tainted.add(profile.uid);throw new ServiceError(503,'PROFILE_CLEANUP_FAILED');}throw error;}
     this.sessions.set(profile.uid,browser);log('info','browser_launch_completed',{profileUid:profile.uid,pid:browser.process()?.pid,durationMs:Math.round(performance.now()-started)});return browser;
   }
