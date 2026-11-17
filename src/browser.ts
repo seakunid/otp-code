@@ -1,6 +1,6 @@
 import puppeteer, { Browser, Page } from 'puppeteer-core';
 import { Lookup, Message, Profile, Rule, ServiceError } from './contracts.js';
-import { receiptMetadata, messageExpiry } from './message.js';
+import { receiptMetadata, messageExpiry, MESSAGE_LOOKBACK_SECONDS } from './message.js';
 import {existsSync,realpathSync} from 'node:fs';
 import {canonicalDirectory} from './store.js';
 import { execFile } from 'node:child_process';
@@ -75,7 +75,8 @@ export class Gmail implements Mailbox {
       log('debug','gmail_identity_verified',{profileUid:profile.uid});
       const quote=(x:string)=>`"${x.replace(/["\\\r\n]/g,' ')}"`;
       const senders=[...rule.senders,...rule.domains.map(x=>`@${x}`)].map(x=>`from:${quote(x)}`);
-      const query=`-in:spam -in:trash -in:drafts after:${input.windowStartedAt} before:${Math.floor(Date.now()/1000)+1} {${senders.join(' ')}} subject:${quote(rule.subject)}`;
+      // The newest matching mail wins: the request window only bounds when the customer asked, not when the provider sent the code.
+      const query=`-in:spam -in:trash -in:drafts after:${Math.floor(Date.now()/1000)-MESSAGE_LOOKBACK_SECONDS} before:${Math.floor(Date.now()/1000)+1} {${senders.join(' ')}} subject:${quote(rule.subject)}`;
       const search=async()=>{
         stage='search';log('debug','gmail_stage_started',{stage,remainingMs:Math.max(0,deadline-Date.now())});await page.goto(`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
         // shortcut: Gmail renders its empty state in the account language; td.TC is the locale-independent empty marker (absent while loading)
@@ -131,11 +132,18 @@ export class Gmail implements Mailbox {
           const popup=new Promise<Page|null>(resolve=>page.once('popup',resolve));
           stage='original_menu';log('debug','gmail_stage_started',{stage});
           // shortcut: the menu is localized; button.Wsq5Cf and a label list cover current en/id UI, add locales when a profile uses one
-          await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"],[data-legacy-message-id="${row.id}"] button[aria-label="Opsi pesan lainnya"],[data-legacy-message-id="${row.id}"] button.Wsq5Cf`);
-          await page.waitForFunction(()=>{
-            const item=[...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)&&/^(?:show original|tampilkan versi asli|tampilkan aslinya)$/i.test(e.textContent?.trim()||''));
-            if(!item)return false;item.click();return true;
-          },{polling:100});
+          // A menu click on a second message in the same thread can land on a leftover overlay, so re-open it instead of failing the read.
+          for(let menuAttempt=1;;menuAttempt++){
+            if(menuAttempt>1)await page.keyboard.press('Escape').catch(()=>{});
+            await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"],[data-legacy-message-id="${row.id}"] button[aria-label="Opsi pesan lainnya"],[data-legacy-message-id="${row.id}"] button.Wsq5Cf`);
+            try{
+              await page.waitForFunction(()=>{
+                const item=[...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)&&/^(?:show original|tampilkan versi asli|tampilkan aslinya)$/i.test(e.textContent?.trim()||''));
+                if(!item)return false;item.click();return true;
+              },{polling:100,timeout:Math.max(1,Math.min(5000,deadline-Date.now()))});
+              break;
+            }catch(error){if(menuAttempt>=3||Date.now()>=deadline)throw error;log('warn','gmail_menu_retry',{messageRef:row.id,retry:menuAttempt});}
+          }
           let popupTimer:NodeJS.Timeout|undefined;
           const original=await Promise.race([popup,new Promise<never>((_,reject)=>{popupTimer=setTimeout(()=>reject(new ServiceError(502,'GMAIL_UI_TIMEOUT')),Math.min(10000,Math.max(1,deadline-Date.now())));})]).finally(()=>clearTimeout(popupTimer));
           if(!original)throw new ServiceError(502,'GMAIL_UI_CHANGED');

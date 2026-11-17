@@ -13,10 +13,10 @@ import { Executor } from '../src/executor.js';
 const token='synthetic-test-bearer-0123456789';
 const rule=ruleSchema.parse({providerUid:'provider',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code',purposeMarkers:['code'],pattern:'(?:code(?: is|:)?\\s*)(?<otp>[0-9]{4,8})'});
 const input=()=>lookupSchema.parse({requestUid:'request',attemptUid:'attempt',providerUid:'provider',accountUid:'account',targetEmail:'target@example.test',purpose:'LOGIN',ruleVersion:1,windowStartedAt:Math.floor(Date.now()/1000)-60,lookupDeadlineAt:Math.floor(Date.now()/1000)+30,otpValiditySeconds:600});
-function fixture(){
+function fixture(receivedAt=Math.floor(Date.now()/1000)){
  const path=mkdtempSync(join(tmpdir(),'otp-test-'));const key=randomBytes(32);const store=new Store(join(path,'state.sqlite'),key);store.createProfile('target@example.test',join(path,'profile'));store.enable(store.profile('target@example.test')!.uid);store.syncRule(rule);store.activate('provider','LOGIN',1);
  let reads=0,closes=0;
- const mailbox={read:async()=>{reads++;return[{ref:'message',sender:'sender@example.test',subject:'code',body:'Your code is 0738',receivedAt:Math.floor(Date.now()/1000)}];},close:async()=>{closes++;}};
+ const mailbox={read:async()=>{reads++;return[{ref:'message',sender:'sender@example.test',subject:'code',body:'Your code is 0738',receivedAt}];},close:async()=>{closes++;}};
  const service=new Retrieval(store,mailbox,new Executor(),5);
  return {store,service,path,key,get reads(){return reads;},get closes(){return closes;}};
 }
@@ -33,12 +33,19 @@ test('HTTP auth, strict input, found closes browser, replay and conflicts',async
  const call=(value:unknown,key='attempt')=>fetch(base+'/v1/lookups',{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json','idempotency-key':key},body:JSON.stringify(value)});
  assert.equal((await fetch(base+'/health/live')).status,401);
  assert.equal((await call({...input(),profilePath:'arbitrary'})).status,422);
- assert.equal((await call({...input(),windowStartedAt:Math.floor(Date.now()/1000)-300,lookupDeadlineAt:Math.floor(Date.now()/1000)+200})).status,422);
+ assert.equal((await call({...input(),windowStartedAt:Math.floor(Date.now()/1000)-2*86400,lookupDeadlineAt:Math.floor(Date.now()/1000)+30})).status,422);
  const req=input();const [a,b]=await Promise.all([call(req),call(req)]);assert.equal(a.status,200);assert.equal(b.status,200);assert.equal((await a.json()).code,'0738');assert.equal(f.reads,1);assert.equal(f.closes,1);
  const replay=await call(req);assert.equal((await replay.json()).replayed,true);assert.equal(f.reads,1);
  assert.equal((await call({...req,targetEmail:'other@example.test'})).status,409);
  assert.equal((await call({...req,attemptUid:'another'},'wrong')).status,400);
  const state=readFileSync(join(f.path,'state.sqlite'));assert.equal(state.includes(Buffer.from('Your code is')),false);
+});
+test('lookup serves the newest code even when it predates the request window',async()=>{
+ const f=fixture(Math.floor(Date.now()/1000)-300);
+ const result=await f.service.lookup(input());
+ assert.equal(result.code,'0738');
+ assert.equal(result.receivedAt,Math.floor(Date.now()/1000)-300);
+ f.store.close();
 });
 test('encrypted replay survives restart and cancel tombstone wins',async()=>{
  const f=fixture(),req=input();await f.service.lookup(req);f.store.close();const store=new Store(join(f.path,'state.sqlite'),f.key);assert.equal(store.read('attempt').code,'0738');store.cancel('attempt',req.lookupDeadlineAt);assert.equal(store.read('attempt'),undefined);assert.throws(()=>store.admit('attempt',store.hash(req),req.lookupDeadlineAt),/LOOKUP_CANCELLED/);store.close();

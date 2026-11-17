@@ -5,6 +5,7 @@ import { Mailbox } from './browser.js';
 import { Executor } from './executor.js';
 import { extract } from './extraction.js';
 import { log, errorFields, withLogContext } from './log.js';
+import { MESSAGE_LOOKBACK_SECONDS } from './message.js';
 export class Retrieval {
   private running=new Map<string,{hash:string;promise:Promise<unknown>;controller:AbortController;waiters:number}>();
   private maintenance=new Set<{controller:AbortController;promise:Promise<unknown>}>();
@@ -22,7 +23,8 @@ export class Retrieval {
     input={...input,targetEmail:input.targetEmail.toLowerCase(),excludedSourceMessageRefs:[...input.excludedSourceMessageRefs].sort()};
     const now=Math.floor(Date.now()/1000);
     if(input.lookupDeadlineAt<=now)throw new ServiceError(410,'LOOKUP_EXPIRED');
-    if(input.lookupDeadlineAt>now+300||input.windowStartedAt>now||input.windowStartedAt<now-360||input.lookupDeadlineAt-input.windowStartedAt>360)throw new ServiceError(422,'INVALID_TIME_WINDOW');
+    // The window now only bounds how far back the newest code may come from, so it may span the lookback instead of the old 6 minutes.
+    if(input.lookupDeadlineAt>now+300||input.windowStartedAt>now||input.windowStartedAt<now-MESSAGE_LOOKBACK_SECONDS||input.lookupDeadlineAt-input.windowStartedAt>MESSAGE_LOOKBACK_SECONDS+300)throw new ServiceError(422,'INVALID_TIME_WINDOW');
     const hash=this.store.hash({input,diagnostic});this.store.admit(input.attemptUid,hash,input.lookupDeadlineAt);
     log('info','lookup_admitted');
     const running=this.running.get(input.attemptUid);
@@ -61,8 +63,8 @@ export class Retrieval {
           const pollStarted=performance.now();polls++;
           log('debug','lookup_poll_started',{poll:polls,remainingMs:Math.max(0,input.lookupDeadlineAt*1000-Date.now())});
           const fetched=await this.mailbox.read(profile,input,rule,controller.signal);
-          const messages=fetched.filter(m=>m.receivedAt>=input.windowStartedAt&&m.receivedAt<=Math.floor(Date.now()/1000)).sort((a,b)=>b.receivedAt-a.receivedAt);
-          log('info','lookup_poll_completed',{poll:polls,fetchedCount:fetched.length,messageCount:messages.length,outsideWindowCount:fetched.length-messages.length,durationMs:Math.round(performance.now()-pollStarted)});
+          const messages=fetched.filter(m=>m.receivedAt>=Math.floor(Date.now()/1000)-MESSAGE_LOOKBACK_SECONDS&&m.receivedAt<=Math.floor(Date.now()/1000)).sort((a,b)=>b.receivedAt-a.receivedAt);
+          log('info','lookup_poll_completed',{poll:polls,fetchedCount:fetched.length,messageCount:messages.length,outsideLookbackCount:fetched.length-messages.length,durationMs:Math.round(performance.now()-pollStarted)});
           let result:Result|undefined,matchedSender='';let rejectedCount=0,skippedCount=0;
           for(const message of messages){
             if(result?.receivedAt!==undefined&&message.receivedAt<result.receivedAt)break;
