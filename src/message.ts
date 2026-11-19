@@ -1,4 +1,8 @@
 import { ServiceError } from './contracts.js';
+// Lookback for the newest code instead of the request window: a customer often asks after the mail arrived, and the code's own expiry keeps stale ones out.
+export const MESSAGE_LOOKBACK_SECONDS=86400;
+// The model sees the newest mails only; a provider burst can push a real code past this window.
+export const MAX_CANDIDATE_MESSAGES=5;
 export function decodeSubject(value:string){
  return value.replace(/(\?=)[ \t]+(?==\?)/g,'$1').replace(/=\?([^?]+)\?([bq])\?([^?]*)\?=/gi,(_word,charset:string,encoding:string,text:string)=>{
   try{

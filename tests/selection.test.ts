@@ -6,16 +6,17 @@ import {Store} from '../src/store.js';
 import {Retrieval} from '../src/service.js';
 import {createApp} from '../src/app.js';
 import {Message,lookupSchema,ruleSchema} from '../src/contracts.js';
+import {stubClassifier} from './helpers/classifier.js';
 
 const token='synthetic-selection-token-0123456789';
-const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'exact',subject:'Sign-in code',purposeMarkers:['sign-in code'],pattern:'code is (?<otp>[0-9]{6})'});
+const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'exact',subject:'Sign-in code'});
 const message=(ref:string,body='Your sign-in code is 001234.',receivedAt=Math.floor(Date.now()/1000)-1):Message=>({ref,sender:'sender@example.test',subject:rule.subject,body,receivedAt});
 
 async function fixture(t:TestContext,messages:Message[]){
  const store=new Store(':memory:',randomBytes(32)),profile=store.createProfile('target@example.test',resolve('selection-profile'));
  store.enable(profile.uid);store.syncRule(rule);store.activate('p','LOGIN',1);
  let reads=0,closes=0;
- const service=new Retrieval(store,{read:async()=>{reads++;return messages;},close:async()=>{closes++;}},undefined,5);
+ const service=new Retrieval(store,{read:async()=>{reads++;return messages;},close:async()=>{closes++;}},undefined,5,false,false,stubClassifier());
  const server=createApp(service,token,{allowSyntheticVerification:true}).listen(0,'127.0.0.1');
  await new Promise<void>(r=>server.once('listening',r));
  t.after(async()=>{await service.shutdown();await new Promise<void>(r=>server.close(()=>r()));store.close();});
@@ -28,8 +29,8 @@ async function fixture(t:TestContext,messages:Message[]){
  return {store,input,post,get reads(){return reads;},get closes(){return closes;}};
 }
 
-for(const warning of ['This code has expired.','Your code is no longer valid.','The code has been replaced.'])test('HTTP lookup rejects explicit invalidation: '+warning,async(t)=>{
- const now=Math.floor(Date.now()/1000),f=await fixture(t,[message('newest','Your sign-in code is 001234. '+warning,now-1),message('older','Your sign-in code is 009876.',now-2)]);
+test('HTTP lookup rejects a code whose provider validity already lapsed',async(t)=>{
+ const now=Math.floor(Date.now()/1000),f=await fixture(t,[message('newest','Your sign-in code is 001234.',now-400)]);
  const result=await f.post('/v1/lookups',f.input('expired'));
  assert.equal(result.status,410);assert.equal(result.body.error.code,'OTP_EXPIRED');assert.equal(result.body.code,undefined);
  assert.equal(f.closes,1);assert.equal(f.store.db.prepare('SELECT COUNT(*) n FROM used_source').get()?.n,0);
@@ -41,17 +42,16 @@ test('HTTP lookup accepts future expiry and ignores quoted expired text',async(t
  assert.equal(result.status,200);assert.equal(result.body.code,'001234');
 });
 
-for(const reverse of [false,true])test('HTTP lookup rejects newest timestamp ties regardless of mailbox order: '+reverse,async(t)=>{
- const messages=[message('one'),message('two','Your sign-in code is 009876.')];
- messages[1].receivedAt=messages[0].receivedAt;
- const f=await fixture(t,reverse?messages.reverse():messages),result=await f.post('/v1/lookups',f.input('tie'));
- assert.equal(result.status,200);assert.equal(result.body.outcome,'AMBIGUOUS');assert.equal(result.body.code,undefined);
- assert.equal(result.body.sourceMessageRef,undefined);assert.equal(f.closes,1);
- assert.equal(f.store.db.prepare('SELECT COUNT(*) n FROM used_source').get()?.n,0);
+for(const reverse of [false,true])test('HTTP lookup chooses the newest mail regardless of mailbox order: '+reverse,async(t)=>{
+ const now=Math.floor(Date.now()/1000);
+ const messages=[message('newer','Your sign-in code is 001234.',now-1),message('older','Your sign-in code is 009876.',now-2)];
+ const f=await fixture(t,reverse?messages.reverse():messages),result=await f.post('/v1/lookups',f.input('newest'));
+ assert.equal(result.status,200);assert.equal(result.body.outcome,'FOUND');assert.equal(result.body.sourceMessageRef,'newer');
+ assert.equal(result.body.code,'001234');assert.equal(f.closes,1);
 });
 
 test('HTTP lookup chooses the newest qualifying source and ignores excluded or untrusted ties',async(t)=>{
- const now=Math.floor(Date.now()/1000),f=await fixture(t,[message('older','Your sign-in code is 009876. This code has expired.',now-2),message('excluded'),{...message('spoof'),sender:'attacker@example.test'},message('current')]);
+ const now=Math.floor(Date.now()/1000),f=await fixture(t,[message('older','Your sign-in code is 009876.',now-2),message('excluded'),{...message('spoof'),sender:'attacker@example.test'},message('current')]);
  const input={...f.input('newest'),excludedSourceMessageRefs:['excluded']},result=await f.post('/v1/lookups',input);
  assert.equal(result.status,200);assert.equal(result.body.outcome,'FOUND');assert.equal(result.body.sourceMessageRef,'current');
 });

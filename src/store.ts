@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, win32 } from 'node:path';
 import { existsSync, lstatSync } from 'node:fs';
 import { normalizeEmail, Profile, Rule, ServiceError, Cancellation } from './contracts.js';
+import {log} from './log.js';
 export function canonicalDirectory(directory:string){
  if(process.platform!=='win32')return directory;
  if(!win32.isAbsolute(directory)||directory.startsWith('\\\\'))throw new ServiceError(422,'PROFILE_PATH_INVALID');
@@ -45,12 +46,12 @@ export class Store {
     directory=canonicalDirectory(directory);
     try { this.db.prepare('INSERT INTO profile(uid,email,directory) VALUES(?,?,?)').run(uid,normalizeEmail(email),directory); }
     catch { throw new ServiceError(409,'PROFILE_EXISTS'); }
-    return this.profile(email)!;
+    log('info','profile_created',{profileUid:uid});return this.profile(email)!;
   }
   profile(email: string) { return this.db.prepare('SELECT * FROM profile WHERE email=?').get(normalizeEmail(email)) as Profile|undefined; }
   profileByUID(uid: string) { return this.db.prepare('SELECT * FROM profile WHERE uid=?').get(uid) as Profile|undefined; }
-  enable(uid: string) { this.db.prepare('UPDATE profile SET enabled=1,verified=1 WHERE uid=?').run(uid); }
-  disable(uid:string){this.db.prepare('UPDATE profile SET enabled=0,revision=revision+1 WHERE uid=?').run(uid);}
+  enable(uid: string) { this.db.prepare('UPDATE profile SET enabled=1,verified=1 WHERE uid=?').run(uid);log('info','profile_enabled',{profileUid:uid}); }
+  disable(uid:string){this.db.prepare('UPDATE profile SET enabled=0,revision=revision+1 WHERE uid=?').run(uid);log('info','profile_disabled',{profileUid:uid});}
   list(after = '', limit = 100, prefix='') {
     if(!Number.isInteger(limit)||limit<1||limit>1000)throw new ServiceError(422,'INVALID_PAGE_LIMIT');
     return this.db.prepare('SELECT uid,email,enabled,verified,revision FROM profile WHERE email>? AND email>=? AND email<? ORDER BY email LIMIT ?').all(after,prefix,prefix+'\uffff',limit);
@@ -60,24 +61,25 @@ export class Store {
     const old=this.db.prepare('SELECT hash FROM rule WHERE provider=? AND purpose=? AND version=?').get(rule.providerUid,rule.purpose,rule.version);
     if (old && old.hash!==hash) throw new ServiceError(409,'RULE_VERSION_CONFLICT');
     this.db.prepare('INSERT OR IGNORE INTO rule VALUES(?,?,?,?,?)').run(rule.providerUid,rule.purpose,rule.version,hash,body);
-    return {version:rule.version,hash};
+    log('info','rule_synced',{providerUid:rule.providerUid,purpose:rule.purpose,ruleVersion:rule.version,replayed:!!old});return {version:rule.version,hash};
   }
   activate(provider: string,purpose: string,version: number) {
     if(this.revoked(provider,purpose,version))throw new ServiceError(409,'RULE_REVOKED');
     if (!this.db.prepare('SELECT 1 FROM rule WHERE provider=? AND purpose=? AND version=?').get(provider,purpose,version)) throw new ServiceError(409,'RULE_VERSION_CONFLICT');
     this.db.prepare('INSERT INTO active_rule VALUES(?,?,?) ON CONFLICT(provider,purpose) DO UPDATE SET version=excluded.version').run(provider,purpose,version);
+    log('debug','rule_activation_written',{providerUid:provider,purpose,ruleVersion:version});
   }
   ruleCommand(provider:string,purpose:string,version:number,command:string,commandUid:string,expectedActiveRevision:number){
     const hash=this.hash({provider,purpose,version,command,expectedActiveRevision});
     const old=this.db.prepare('SELECT hash,result FROM rule_command WHERE uid=?').get(commandUid);
-    if(old){if(old.hash!==hash)throw new ServiceError(409,'IDEMPOTENCY_CONFLICT');return JSON.parse(String(old.result));}
+    if(old){if(old.hash!==hash)throw new ServiceError(409,'IDEMPOTENCY_CONFLICT');log('info','rule_command_replayed',{providerUid:provider,purpose,ruleVersion:version,commandUid,command});return JSON.parse(String(old.result));}
     this.db.exec('BEGIN IMMEDIATE');
     try{
       const active=Number(this.db.prepare('SELECT version FROM active_rule WHERE provider=? AND purpose=?').get(provider,purpose)?.version||0);
       if(active!==expectedActiveRevision)throw new ServiceError(409,'ACTIVE_RULE_CONFLICT');
       if(command==='activate')this.activate(provider,purpose,version);else this.revoke(provider,purpose,version);
       const result={version,active:command==='activate',commandUid,activeRevision:command==='activate'?version:active===version?0:active};
-      this.db.prepare('INSERT INTO rule_command VALUES(?,?,?)').run(commandUid,hash,JSON.stringify(result));this.db.exec('COMMIT');return result;
+      this.db.prepare('INSERT INTO rule_command VALUES(?,?,?)').run(commandUid,hash,JSON.stringify(result));this.db.exec('COMMIT');log('info','rule_command_completed',{providerUid:provider,purpose,ruleVersion:version,commandUid,command,activeRevision:result.activeRevision});return result;
     }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
   rule(provider: string,purpose: string,version: number,diagnostic=false) {
@@ -88,11 +90,12 @@ export class Store {
     return JSON.parse(String(r.body)) as Rule;
   }
   proof(provider:string,purpose:string,version:number,email:string){return this.db.prepare('SELECT * FROM rule_proof WHERE provider=? AND purpose=? AND version=? AND email=?').get(provider,purpose,version,email);}
-  verifyRule(provider:string,purpose:string,version:number,email:string,hash:string,kind:string){this.db.prepare('INSERT OR REPLACE INTO rule_proof VALUES(?,?,?,?,?,?,?)').run(provider,purpose,version,email,hash,kind,Math.floor(Date.now()/1000));}
+  verifyRule(provider:string,purpose:string,version:number,email:string,hash:string,kind:string){this.db.prepare('INSERT OR REPLACE INTO rule_proof VALUES(?,?,?,?,?,?,?)').run(provider,purpose,version,email,hash,kind,Math.floor(Date.now()/1000));log('info','rule_verified',{providerUid:provider,purpose,ruleVersion:version,verificationKind:kind});}
   revoked(provider:string,purpose:string,version:number){return Boolean(this.db.prepare('SELECT 1 FROM revoked_rule WHERE provider=? AND purpose=? AND version=?').get(provider,purpose,version));}
   revoke(provider:string,purpose:string,version:number){
     this.db.prepare('INSERT OR IGNORE INTO revoked_rule VALUES(?,?,?)').run(provider,purpose,version);
     this.db.prepare('DELETE FROM active_rule WHERE provider=? AND purpose=? AND version=?').run(provider,purpose,version);
+    log('debug','rule_revocation_written',{providerUid:provider,purpose,ruleVersion:version});
   }
   admit(uid:string,hash:string,deadline:number) {
     const old=this.db.prepare('SELECT * FROM attempt WHERE uid=?').get(uid);
@@ -147,12 +150,14 @@ export class Store {
     this.db.prepare('INSERT INTO used_source VALUES(?,?,?,?) ON CONFLICT(email,ref) DO UPDATE SET owner=excluded.owner,until=excluded.until').run(email,ref,uid,now+86400);
   }
   purge(now:number) {
-    this.db.prepare('UPDATE attempt SET result=NULL WHERE uid IN (SELECT a.uid FROM attempt a LEFT JOIN terminal t ON t.uid=a.uid WHERE a.result IS NOT NULL AND (a.deadline<=? OR (t.expires>0 AND t.expires<=?)) LIMIT 1000)').run(now,now);
-    this.db.prepare('DELETE FROM attempt_context WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? LIMIT 1000)').run(now-86400);
-    this.db.prepare('DELETE FROM cancellation WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? LIMIT 1000)').run(now-86400);
-    this.db.prepare('DELETE FROM terminal WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? LIMIT 1000)').run(now-86400);
-    this.db.prepare('DELETE FROM attempt WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? AND uid NOT IN(SELECT uid FROM cleanup) LIMIT 1000)').run(now-86400);
-    this.db.prepare('DELETE FROM used_source WHERE rowid IN(SELECT rowid FROM used_source WHERE until<=? LIMIT 1000)').run(now);
+    const started=performance.now();let changedRows=0;
+    changedRows+=Number(this.db.prepare('UPDATE attempt SET result=NULL WHERE uid IN (SELECT a.uid FROM attempt a LEFT JOIN terminal t ON t.uid=a.uid WHERE a.result IS NOT NULL AND (a.deadline<=? OR (t.expires>0 AND t.expires<=?)) LIMIT 1000)').run(now,now).changes);
+    changedRows+=Number(this.db.prepare('DELETE FROM attempt_context WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? LIMIT 1000)').run(now-86400).changes);
+    changedRows+=Number(this.db.prepare('DELETE FROM cancellation WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? LIMIT 1000)').run(now-86400).changes);
+    changedRows+=Number(this.db.prepare('DELETE FROM terminal WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? LIMIT 1000)').run(now-86400).changes);
+    changedRows+=Number(this.db.prepare('DELETE FROM attempt WHERE uid IN(SELECT uid FROM attempt WHERE deadline<=? AND uid NOT IN(SELECT uid FROM cleanup) LIMIT 1000)').run(now-86400).changes);
+    changedRows+=Number(this.db.prepare('DELETE FROM used_source WHERE rowid IN(SELECT rowid FROM used_source WHERE until<=? LIMIT 1000)').run(now).changes);
+    if(changedRows)log('info','state_purged',{changedRows,durationMs:Math.round(performance.now()-started)});
   }
   close() { this.db.close(); }
 }
