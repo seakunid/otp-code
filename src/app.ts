@@ -2,9 +2,8 @@ import express from 'express';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
-import { lookupSchema, ruleSchema, cancelSchema, purpose, ServiceError } from './contracts.js';
+import { lookupSchema, ruleSchema, cancelSchema, purpose, ServiceError, senderAccepted } from './contracts.js';
 import { Retrieval } from './service.js';
-import { extract, validateRule } from './extraction.js';
 import { log, errorFields, withLogContext } from './log.js';
 export function createApp(service:Retrieval,token:string,options:{allowSyntheticVerification?:boolean}={}){
   if(token.length<24)throw Error('Bearer token must contain at least 24 characters');
@@ -53,15 +52,21 @@ export function createApp(service:Retrieval,token:string,options:{allowSynthetic
     service.store.cancelIdentity(req.params.attemptId,body);
     res.json({...await service.cancel(req.params.attemptId,body.lookupDeadlineAt),commandUid:body.commandUid});
   });
-  app.post('/v1/rules/validate',async(req,res)=>{const rule=ruleSchema.parse(req.body);await validateRule(rule);log('info','rule_validated',{providerUid:rule.providerUid,purpose:rule.purpose,ruleVersion:rule.version});res.json({valid:true,hash:service.store.hash(req.body)});});
+  app.post('/v1/rules/validate',async(req,res)=>{const rule=ruleSchema.parse(req.body);log('info','rule_validated',{providerUid:rule.providerUid,purpose:rule.purpose,ruleVersion:rule.version});res.json({valid:true,hash:service.store.hash(req.body)});});
   app.post('/v1/rules/preview',async(req,res)=>{
     const input=z.object({rule:ruleSchema,message:z.object({sender:z.email(),subject:z.string().max(500),body:z.string().max(262144)}).strict()}).strict().parse(req.body);
-    const result=await extract(input.rule,{...input.message,ref:'synthetic',receivedAt:Math.floor(Date.now()/1000)});
-    log('info','rule_preview_completed',{providerUid:input.rule.providerUid,purpose:input.rule.purpose,ruleVersion:input.rule.version,outcome:result.outcome});res.json(result);
+    const now=Math.floor(Date.now()/1000);
+    const logPreview=(outcome:string)=>log('info','rule_preview_completed',{providerUid:input.rule.providerUid,purpose:input.rule.purpose,ruleVersion:input.rule.version,outcome});
+    if(!senderAccepted(input.rule,input.message.sender)){logPreview('NOT_FOUND');res.json({outcome:'NOT_FOUND',reason:'SENDER_MISMATCH'});return;}
+    // A pasted mail has no rendered anchor list, so its own text is the only link source the preview can check.
+    const message={ref:'synthetic',...input.message,links:input.message.body,receivedAt:now};
+    const answer=await service.llm.classify({providerUid:input.rule.providerUid,purpose:input.rule.purpose,requestedAt:now-60,now,messages:[message]});
+    logPreview(answer?'FOUND':'NOT_FOUND');
+    res.json(answer?{outcome:'FOUND',reason:answer.reason,code:answer.value}:{outcome:'NOT_FOUND',reason:'NO_ARTIFACT'});
   });
   app.put('/v1/providers/:providerUid/rules/:purpose/versions/:version',async(req,res)=>{
     const rule=ruleSchema.parse(req.body);if(rule.providerUid!==req.params.providerUid||rule.purpose!==req.params.purpose||String(rule.version)!==req.params.version)throw new ServiceError(422,'RULE_IDENTITY_MISMATCH');
-    await validateRule(rule);res.json(service.store.syncRule(rule,service.store.hash(req.body)));
+    res.json(service.store.syncRule(rule,service.store.hash(req.body)));
   });
   app.get('/v1/providers/:providerUid/rules/:purpose',(req,res)=>{
     const provider=z.string().min(1).max(128).parse(req.params.providerUid),type=purpose.parse(req.params.purpose);

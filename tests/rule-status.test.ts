@@ -5,7 +5,7 @@ test('authenticated rule status reports only the accepted active revision and ha
  const url='http://127.0.0.1:'+(server.address() as {port:number}).port+'/v1/providers/p/rules/LOGIN',headers={authorization:'Bearer '+token};
  try{
   assert.equal((await fetch(url)).status,401);assert.equal((await (await fetch(url,{headers})).json()).activeRevision,0);
-  const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code',purposeMarkers:['sign-in code'],pattern:'(?<otp>[0-9]{6})'});store.syncRule(rule);store.activate('p','LOGIN',1);store.syncRule({...rule,version:2});
+  const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code'});store.syncRule(rule);store.activate('p','LOGIN',1);store.syncRule({...rule,version:2});
   assert.deepEqual(await (await fetch(url,{headers})).json(),{providerUid:'p',purpose:'LOGIN',activeRevision:1,hash:store.hash(rule)});
   store.revoke('p','LOGIN',1);assert.equal((await (await fetch(url,{headers})).json()).activeRevision,0);assert.equal((await fetch(url.replace('LOGIN','OTHER'),{headers})).status,422);
  }finally{await new Promise<void>(r=>server.close(()=>r()));store.close();}

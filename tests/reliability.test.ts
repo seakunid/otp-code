@@ -8,9 +8,9 @@ import {Store} from '../src/store.js';
 import {Executor} from '../src/executor.js';
 import {Retrieval} from '../src/service.js';
 import {ruleSchema,lookupSchema} from '../src/contracts.js';
-import {extract,capture,validateRule} from '../src/extraction.js';
-import {receiptMetadata,decodeSubject} from '../src/message.js';
-const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code',purposeMarkers:['sign-in code'],pattern:'code is (?<otp>[0-9]{6})'});
+import {receiptMetadata,decodeSubject,messageExpiry} from '../src/message.js';
+import {stubClassifier} from './helpers/classifier.js';
+const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code'});
 const message={ref:'m',sender:'sender@example.test',subject:'code',body:'Your sign-in code is 001234',receivedAt:Math.floor(Date.now()/1000)};
 test('MIME subject decoding preserves Unicode and adjacent encoded words; malformed bytes fail closed',()=>{
  assert.equal(decodeSubject('=?UTF-8?B?S29kZSDwn5SS?='),'Kode 🔒');
@@ -19,21 +19,17 @@ test('MIME subject decoding preserves Unicode and adjacent encoded words; malfor
  assert.throws(()=>decodeSubject('=?UTF-8?B?%%%?='),/MESSAGE_SUBJECT_UNVERIFIED/);
  assert.throws(()=>decodeSubject('=?UTF-8?B?/w==?='),/MESSAGE_SUBJECT_UNVERIFIED/);
 });
-function fixture(close=async()=>{}){const store=new Store(':memory:',randomBytes(32));const p=store.createProfile('target@example.test',resolve('test-directory'));store.enable(p.uid);store.syncRule(rule);store.activate('p','LOGIN',1);const executor=new Executor();const service=new Retrieval(store,{read:async()=>[message],close},executor,5);const now=Math.floor(Date.now()/1000);const input=lookupSchema.parse({requestUid:'r',attemptUid:'a',providerUid:'p',accountUid:'c',targetEmail:'target@example.test',purpose:'LOGIN',ruleVersion:1,windowStartedAt:now-1,lookupDeadlineAt:now+30,otpValiditySeconds:300});return{store,service,input,executor};}
-test('purpose checks reject cross-purpose codes and recovery, preserve explicit security outcome',async()=>{
- assert.equal((await extract(rule,{...message,body:'Password reset code is 001234'})).outcome,'NOT_FOUND');
- assert.equal((await extract(rule,{...message,body:'Your payment code is 001234'})).outcome,'NOT_FOUND');
- assert.equal((await extract(rule,{...message,body:'Security alert: suspicious activity. sign-in code is 001234'})).outcome,'SECURITY_ALERT');
- assert.equal((await extract(rule,{...message,body:'code is 001234'})).outcome,'NOT_FOUND');
-});
-test('regex catastrophic input terminates within boundary',async()=>{
- const start=Date.now();await assert.rejects(capture({...rule,pattern:'(?<otp>(a+)+)$'},'a'.repeat(10000)+'!'),/REGEX_TIMEOUT/);assert.ok(Date.now()-start<1000);
-});
+function fixture(close=async()=>{}){const store=new Store(':memory:',randomBytes(32));const p=store.createProfile('target@example.test',resolve('test-directory'));store.enable(p.uid);store.syncRule(rule);store.activate('p','LOGIN',1);const executor=new Executor();const service=new Retrieval(store,{read:async()=>[message],close},executor,5,false,false,stubClassifier());const now=Math.floor(Date.now()/1000);const input=lookupSchema.parse({requestUid:'r',attemptUid:'a',providerUid:'p',accountUid:'c',targetEmail:'target@example.test',purpose:'LOGIN',ruleVersion:1,windowStartedAt:now-1,lookupDeadlineAt:now+30,otpValiditySeconds:300});return{store,service,input,executor};}
 test('receipt uses Gmail Received timestamp, exact delivered-to and authentication',()=>{
  const headers='Delivered-To: target@example.test\r\nReceived: from x by mx.google.com with ESMTPS; Sun, 08 Nov 2026 03:00:00 +0700\r\nFrom: sender@example.test\r\nDate: Sun, 08 Nov 2030 03:00:00 +0700\r\nMessage-ID: <test@example.test>\r\nAuthentication-Results: mx.google.com; dkim=pass header.i=@example.test\r\n\r\nbody';
  assert.equal(receiptMetadata(headers,'target@example.test','sender@example.test')?.receivedAt,Math.floor(Date.parse('2026-11-07T20:00:00Z')/1000));
  assert.equal(receiptMetadata(headers,'alias@example.test','sender@example.test'),undefined);
  assert.throws(()=>receiptMetadata(headers.replace('dkim=pass','dkim=fail'),'target@example.test','sender@example.test'),/SENDER_AUTH_UNVERIFIED/);
+});
+test('expiry uses the earliest current instruction and ignores quoted ones',()=>{
+ assert.equal(messageExpiry('Valid for 5 minutes. Expires in 30 seconds.',1000),1030);
+ assert.equal(messageExpiry('Valid for 5 minutes.\n----- Previous message -----\nExpires in 1 second.',1000),1300);
+ assert.equal(messageExpiry('Please use your code.',1000),undefined);
 });
 test('result is persisted before cleanup; failed cleanup quarantines browser capacity and blocks replay',async()=>{
  let f:ReturnType<typeof fixture>;f=fixture(async()=>{assert.equal(f.store.read('a').outcome,'FOUND');throw Error('close failed');});
@@ -72,20 +68,16 @@ test('revocation blocks completed replay and rejects reactivation',async()=>{
  const f=fixture();await f.service.lookup(f.input);f.store.revoke('p','LOGIN',1);await assert.rejects(f.service.lookup(f.input),/RULE_REVOKED/);assert.throws(()=>f.store.activate('p','LOGIN',1),/RULE_REVOKED/);f.store.close();
 });
 
-test('empty captures and unaligned authenticated senders fail closed',async()=>{
- await assert.rejects(validateRule({...rule,pattern:'(?<otp>[0-9]*)'}),/EMPTY_OTP_CAPTURE/);
+test('unaligned authenticated senders fail closed',async()=>{
  const headers='Delivered-To: target@example.test\nReceived: by mx.google.com; Sun, 08 Nov 2026 03:00:00 +0700\nFrom: sender@example.test\nMessage-ID: <x@example.test>\nAuthentication-Results: mx.google.com; dkim=pass header.i=@attacker.test\n\nbody';
  assert.throws(()=>receiptMetadata(headers,'target@example.test','sender@example.test'),/SENDER_AUTH_UNVERIFIED/);
-});
-test('code output contains only supported letters and digits; punctuation fails closed',async()=>{
- assert.equal((await extract({...rule,pattern:'code is (?<otp>[^\\n]+)'},{...message,body:'Your sign-in code is <script>alert(1)</script>'})).outcome,'AMBIGUOUS');
 });
 
 test('pinned profile disable prevents replay; cancel payload must keep original deadline',async()=>{
  const f=fixture();await f.service.lookup(f.input);f.store.disable(f.store.profile(f.input.targetEmail)!.uid);await assert.rejects(f.service.lookup(f.input),/PROFILE_CHANGED/);await assert.rejects(f.service.cancel('a',f.input.lookupDeadlineAt+1),/CANCEL_IDENTITY_CONFLICT/);f.store.close();
 });
-test('terminal parser failure replays without a second mailbox operation',async()=>{
- const f=fixture();let reads=0;f.service.mailbox.read=async()=>{reads++;return[{...message,expiresAt:Math.floor(Date.now()/1000)-1}];};await assert.rejects(f.service.lookup(f.input),/OTP_EXPIRED/);await assert.rejects(f.service.lookup(f.input),/OTP_EXPIRED/);assert.equal(reads,1);f.store.close();
+test('terminal expiry replays without a second mailbox operation',async()=>{
+ const f=fixture();let reads=0;f.service.mailbox.read=async()=>{reads++;return[{...message,receivedAt:Math.floor(Date.now()/1000)-400}];};await assert.rejects(f.service.lookup(f.input),/OTP_EXPIRED/);await assert.rejects(f.service.lookup(f.input),/OTP_EXPIRED/);assert.equal(reads,1);f.store.close();
 });
 test('duplicate subscribers are bounded; shared work uses one browser slot',async()=>{
  const f=fixture();let release!:()=>void;f.service.mailbox.read=async()=>{await new Promise<void>(r=>release=r);return[message];};const calls=Array.from({length:10},()=>f.service.lookup(f.input));await assert.rejects(f.service.lookup(f.input),/REPLAY_WAITERS_FULL/);assert.equal(f.executor.stats().active,1);release();await Promise.all(calls);f.store.close();
@@ -101,7 +93,7 @@ test('wrong encryption key fails startup without discarding durable records',()=
  const dir=mkdtempSync(join(tmpdir(),'otp-wrong-key-')),file=join(dir,'state.sqlite'),key=randomBytes(32);const store=new Store(file,key);store.createProfile('a@example.test',resolve('wrong-key-profile'));store.close();assert.throws(()=>new Store(file,randomBytes(32)),/STATE_KEY_INVALID/);const reopened=new Store(file,key);assert.ok(reopened.profile('a@example.test'));reopened.close();rmSync(dir,{recursive:true});
 });
 test('production refuses a synthetic per-profile proof even if an active pointer exists',async()=>{
- const f=fixture(),service=new Retrieval(f.store,f.service.mailbox,f.executor,5,true);f.store.verifyRule('p','LOGIN',1,f.input.targetEmail,f.store.hash(rule),'SYNTHETIC');
+ const f=fixture(),service=new Retrieval(f.store,f.service.mailbox,f.executor,5,true,false,stubClassifier());f.store.verifyRule('p','LOGIN',1,f.input.targetEmail,f.store.hash(rule),'SYNTHETIC');
  await assert.rejects(service.lookup(f.input),/PROFILE_RULE_NOT_VERIFIED/);f.store.close();
 });
 

@@ -13,6 +13,7 @@ const token=process.env.OTP_RETRIEVAL_TOKEN||'';
 const key=Buffer.from(process.env.OTP_RETRIEVAL_KEY||'','base64');
 const host=process.env.OTP_BIND_HOST||'127.0.0.1';
 if(!isPrivateBindHost(host))throw Error('Bind only to loopback or Tailscale address');
+if(!process.env.LLM_ENDPOINT||!process.env.API_KEY||!process.env.MODEL)throw Error('LLM_ENDPOINT, API_KEY and MODEL are required');
 stage='state';
 const store=new Store(statePath(),key);
 log('info','state_opened');

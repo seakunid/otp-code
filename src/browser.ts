@@ -1,12 +1,13 @@
 import puppeteer, { Browser, Page } from 'puppeteer-core';
 import { Lookup, Message, Profile, Rule, ServiceError } from './contracts.js';
-import { receiptMetadata, messageExpiry, MESSAGE_LOOKBACK_SECONDS } from './message.js';
+import { receiptMetadata, messageExpiry, MESSAGE_LOOKBACK_SECONDS, MAX_CANDIDATE_MESSAGES } from './message.js';
 import {existsSync,realpathSync} from 'node:fs';
 import {canonicalDirectory} from './store.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {ProfileLease} from './profile-lease.js';
 import {log,errorFields} from './log.js';
+const MAX_THREADS=8;
 export interface Mailbox { read(profile:Profile,input:Lookup,rule:Rule,signal:AbortSignal):Promise<Message[]>; close(profile:Profile):Promise<void>; setup?(profile:Profile,deadline:number,signal?:AbortSignal):Promise<void>; }
 export class Gmail implements Mailbox {
   private sessions=new Map<string,Browser>();
@@ -74,46 +75,32 @@ export class Gmail implements Mailbox {
       }
       log('debug','gmail_identity_verified',{profileUid:profile.uid});
       const quote=(x:string)=>`"${x.replace(/["\\\r\n]/g,' ')}"`;
+      // Parent domains only: the sending host below the domain is not configuration.
       const senders=[...rule.senders,...rule.domains.map(x=>`@${x}`)].map(x=>`from:${quote(x)}`);
+      const subject=rule.subject?` subject:${quote(rule.subject)}`:'';
       // The newest matching mail wins: the request window only bounds when the customer asked, not when the provider sent the code.
-      const query=`-in:spam -in:trash -in:drafts after:${Math.floor(Date.now()/1000)-MESSAGE_LOOKBACK_SECONDS} before:${Math.floor(Date.now()/1000)+1} {${senders.join(' ')}} subject:${quote(rule.subject)}`;
+      // Spam is included because a code filed there is still a code; DKIM alignment is what makes a sender trustworthy.
+      const query=`-in:trash -in:drafts after:${Math.floor(Date.now()/1000)-MESSAGE_LOOKBACK_SECONDS} before:${Math.floor(Date.now()/1000)+1} {${senders.join(' ')}}${subject}`;
       const search=async()=>{
         stage='search';log('debug','gmail_stage_started',{stage,remainingMs:Math.max(0,deadline-Date.now())});await page.goto(`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
         // shortcut: Gmail renders its empty state in the account language; td.TC is the locale-independent empty marker (absent while loading)
         await page.waitForFunction((subject)=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).length>0&&[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).every(e=>(e.querySelector('.bog')?.textContent||'').includes(subject))||[...document.querySelectorAll('td.TC')].some(e=>e.getBoundingClientRect().height>0),{polling:100},rule.subject);
       };
       await search();
-      // shortcut: Gmail renders the result count as span.Dj now and the pager arrows carry no aria-label, so completeness is read from the count; the count renders a moment after the rows and briefly still shows the previous list.
-      const coverage=await(async()=>{
-        const until=Math.min(Date.now()+10000,deadline);
-        for(;;){
-          const state=await page.evaluate(()=>({
-            rows:[...document.querySelectorAll('tr.zA')].filter(e=>e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0).length,
-            counts:[...((([...document.querySelectorAll('span.Dj')].filter(e=>e.getBoundingClientRect().height>0).at(-1)?.textContent)||'').matchAll(/([0-9][0-9,]*)/g))].map(m=>Number(m[1].replace(/,/g,''))),
-            older:!![...document.querySelectorAll('[aria-label="Older"],[aria-label="Next results"],[aria-label="Lebih lama"]')].find(e=>e.getBoundingClientRect().height>0),
-            empty:!![...document.querySelectorAll('td.TC')].find(e=>e.getBoundingClientRect().height>0)
-          }));
-          if(state.rows===0&&state.empty)return null;
-          if(state.rows>0&&state.counts.length>=3&&state.counts[0]===1&&state.counts[1]===state.rows)return{complete:state.counts[1]===state.counts[2],range:state.counts.slice(0,3)};
-          if(state.rows>0&&state.older)return{complete:false,range:undefined};
-          if(Date.now()>=until){log('warn','gmail_coverage_unreadable',{rows:state.rows,counts:state.counts.join(','),older:state.older});return null;}
-          await new Promise(resolve=>setTimeout(resolve,100));
-        }
-      })();
       const refs=await page.evaluate(()=>[...document.querySelectorAll('tr.zA')].filter(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)).map(e=>e.getAttribute('data-legacy-thread-id')||e.querySelector('[data-legacy-thread-id]')?.getAttribute('data-legacy-thread-id')).filter((x):x is string=>Boolean(x)));
-      log('info','gmail_search_completed',{profileUid:profile.uid,threadCount:refs.length,coverageComplete:!!coverage?.complete,coverageRange:coverage?.range?.join('-')});
-      if(refs.length>20||(refs.length>0&&(!coverage?.complete||!coverage.range||coverage.range[0]!==1||coverage.range[1]!==refs.length||coverage.range[2]!==refs.length)))throw new ServiceError(422,'SEARCH_COVERAGE_INCOMPLETE');
+      log('info','gmail_search_completed',{profileUid:profile.uid,threadCount:refs.length,searchDomains:rule.domains.join(','),searchSenderCount:rule.senders.length,searchSubject:rule.subject?'SET':'ANY'});
       const messages:Message[]=[];
+      // The model sees the newest mails only, one per thread, so stop early instead of reading every matching thread.
+      let opened=0;
       for(const ref of refs){
+        if(messages.length>=MAX_CANDIDATE_MESSAGES||opened>=MAX_THREADS)break;
+        opened++;
         signal.throwIfAborted();if(Date.now()>=deadline-5000)throw new ServiceError(504,'TIMEOUT');
         if(!/^[a-f0-9]+$/i.test(ref))throw new ServiceError(502,'GMAIL_UI_CHANGED');
-        await search();
+        // Gmail's in-page router answers "the conversation that you requested could not be loaded" when a row is
+        // clicked after a fresh search load; navigating to the thread URL makes the body render every time.
         stage='message';log('debug','gmail_stage_started',{stage,threadIndex:refs.indexOf(ref)+1});
-        const clicked=await page.evaluate((threadRef)=>{
-          const row=[...document.querySelectorAll<HTMLElement>('tr.zA')].find(e=>e.getBoundingClientRect().height>0&&(e.getAttribute('data-legacy-thread-id')===threadRef||e.querySelector('[data-legacy-thread-id]')?.getAttribute('data-legacy-thread-id')===threadRef));
-          if(!row)return false;row.click();return true;
-        },ref);
-        if(!clicked)throw new ServiceError(502,'GMAIL_THREAD_NOT_FOUND');
+        await page.goto(`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}/${ref}`,{waitUntil:'domcontentloaded',timeout:Math.max(1,deadline-Date.now())});
         await page.waitForSelector('.a3s',{visible:true});
         await page.evaluate(()=>{for(const e of document.querySelectorAll<HTMLElement>('.ajR'))if((e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0))e.click();});
         // The provider template exceeds Gmail's render limit; the code always sits above the clip, and a hidden tail can only lose a capture, never invent one.
@@ -123,30 +110,41 @@ export class Gmail implements Mailbox {
           return [...document.querySelectorAll('.adn')].filter(e=>e.querySelector('.a3s')).map(e=>({
             id:e.getAttribute('data-legacy-message-id')||e.querySelector('[data-legacy-message-id]')?.getAttribute('data-legacy-message-id'),
             sender:e.querySelector('.gD[email]')?.getAttribute('email')||'',subject,
-            body:(()=>{const body=e.querySelector<HTMLElement>('.a3s')?.cloneNode(true) as HTMLElement|undefined;body?.querySelectorAll('.gmail_quote,blockquote').forEach(x=>x.remove());if(!body)return '';body.querySelectorAll('br').forEach(x=>x.replaceWith('\n'));body.querySelectorAll('td,th').forEach(x=>x.append(' '));body.querySelectorAll('div,p,tr').forEach(x=>x.append('\n'));return body.textContent||'';})()
+            body:(()=>{const body=e.querySelector<HTMLElement>('.a3s')?.cloneNode(true) as HTMLElement|undefined;body?.querySelectorAll('.gmail_quote,blockquote').forEach(x=>x.remove());if(!body)return '';body.querySelectorAll('br').forEach(x=>x.replaceWith('\n'));body.querySelectorAll('td,th').forEach(x=>x.append(' '));body.querySelectorAll('div,p,tr').forEach(x=>x.append('\n'));return body.textContent||'';})(),
+            // The rendered text keeps only anchor labels, so a magic-link rule needs the real destinations. Gmail wraps some in /url?q=.
+            links:(()=>{const root=e.querySelector<HTMLElement>('.a3s');if(!root)return '';return [...root.querySelectorAll('a[href]')].map(a=>{const href=a.getAttribute('href')||'';try{const u=new URL(href,'https://mail.google.com');const target=u.hostname==='www.google.com'&&u.pathname==='/url'?u.searchParams.get('q')||'':href;return target.startsWith('https:')?target:'';}catch{return '';}}).filter(Boolean).join('\n').slice(0,16384);})()
           }));
         });
         if(!rows.length)throw new ServiceError(502,'GMAIL_UI_CHANGED');
-        for(const row of rows){
+        // The thread renders oldest first. Newest wins, so read the newest message that verifies and leave the older
+        // copies alone: each one costs a Show original tab, and a thread piles up every mail a customer retriggers.
+        for(const row of [...rows].reverse()){
           if(!row.id||!/^[a-f0-9]+$/i.test(row.id))throw new ServiceError(502,'MESSAGE_METADATA_UNVERIFIED');
-          const popup=new Promise<Page|null>(resolve=>page.once('popup',resolve));
           stage='original_menu';log('debug','gmail_stage_started',{stage});
           // shortcut: the menu is localized; button.Wsq5Cf and a label list cover current en/id UI, add locales when a profile uses one
-          // A menu click on a second message in the same thread can land on a leftover overlay, so re-open it instead of failing the read.
-          for(let menuAttempt=1;;menuAttempt++){
-            if(menuAttempt>1)await page.keyboard.press('Escape').catch(()=>{});
-            await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"],[data-legacy-message-id="${row.id}"] button[aria-label="Opsi pesan lainnya"],[data-legacy-message-id="${row.id}"] button.Wsq5Cf`);
+          // Gmail sometimes swallows the click and opens no tab; a second try recovers it, and a message that still will not open is
+          // skipped instead of failing a read that already verified another mail in the same thread.
+          let original:Page|null=null;
+          for(let menuAttempt=1;menuAttempt<=2&&!original;menuAttempt++){
+            if(menuAttempt>1){await page.keyboard.press('Escape').catch(()=>{});await page.waitForFunction(()=>![...document.querySelectorAll('[role="menu"]')].some(e=>e.getBoundingClientRect().width>0),{polling:50,timeout:800}).catch(()=>{});}
+            const popup=new Promise<Page|null>(resolve=>page.once('popup',resolve));
+            let popupTimer:NodeJS.Timeout|undefined;
             try{
+              await page.click(`[data-legacy-message-id="${row.id}"] button[aria-label="More message options"],[data-legacy-message-id="${row.id}"] button[aria-label="Opsi pesan lainnya"],[data-legacy-message-id="${row.id}"] button.Wsq5Cf`);
               await page.waitForFunction(()=>{
                 const item=[...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e=>(e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0)&&/^(?:show original|tampilkan versi asli|tampilkan aslinya)$/i.test(e.textContent?.trim()||''));
                 if(!item)return false;item.click();return true;
               },{polling:100,timeout:Math.max(1,Math.min(5000,deadline-Date.now()))});
-              break;
-            }catch(error){if(menuAttempt>=3||Date.now()>=deadline)throw error;log('warn','gmail_menu_retry',{messageRef:row.id,retry:menuAttempt});}
+              original=await Promise.race([popup,new Promise<null>(resolve=>{popupTimer=setTimeout(()=>resolve(null),Math.min(10000,Math.max(1,deadline-Date.now())));})]);
+            }catch(error){
+              log('warn','gmail_menu_retry',{messageRef:row.id,retry:menuAttempt,...errorFields(error)});
+              if(Date.now()>=deadline)throw error;
+            }finally{clearTimeout(popupTimer);}
           }
-          let popupTimer:NodeJS.Timeout|undefined;
-          const original=await Promise.race([popup,new Promise<never>((_,reject)=>{popupTimer=setTimeout(()=>reject(new ServiceError(502,'GMAIL_UI_TIMEOUT')),Math.min(10000,Math.max(1,deadline-Date.now())));})]).finally(()=>clearTimeout(popupTimer));
-          if(!original)throw new ServiceError(502,'GMAIL_UI_CHANGED');
+          if(!original){
+            if(!messages.length)throw new ServiceError(502,'GMAIL_UI_TIMEOUT');
+            log('warn','gmail_original_skipped',{messageRef:row.id});continue;
+          }
           const abortOriginal=()=>{void original.close().catch(()=>{});};signal.addEventListener('abort',abortOriginal,{once:true});
           try{
             stage='original_headers';log('debug','gmail_stage_started',{stage});
@@ -156,7 +154,7 @@ export class Gmail implements Mailbox {
             log('debug','gmail_message_verified',{recipientMatched:!!metadata,receivedAt:metadata?.receivedAt});
             if(metadata&&!metadata.subject)throw new ServiceError(502,'MESSAGE_SUBJECT_UNVERIFIED');
             // Replies can have a different Subject from Gmail's conversation heading.
-            if(metadata)messages.push({...metadata,sender:row.sender,subject:metadata.subject!,body:row.body,expiresAt:messageExpiry(row.body,metadata.receivedAt)});
+            if(metadata){messages.push({...metadata,sender:row.sender,subject:metadata.subject!,body:row.body,links:row.links,expiresAt:messageExpiry(row.body,metadata.receivedAt)});break;}
           }finally{signal.removeEventListener('abort',abortOriginal);await original.close().catch(()=>{});}
         }
       }

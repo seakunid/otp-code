@@ -13,8 +13,9 @@ test('actual HTTP replay and cancellation survive abrupt Node process restarts',
  const code=`import {Store} from ${modulePath('store')};import {Retrieval} from ${modulePath('service')};import {createApp} from ${modulePath('app')};import {ruleSchema} from ${modulePath('contracts')};import {appendFileSync} from 'node:fs';import {join} from 'node:path';
  const store=new Store(join(process.env.TEST_ROOT,'state.sqlite'),Buffer.from(process.env.TEST_KEY,'base64'));
  const profile=store.profile('target@example.test')||store.createProfile('target@example.test',join(process.env.TEST_ROOT,'profile'));store.enable(profile.uid);
- const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'exact',subject:'code',purposeMarkers:['sign-in code'],pattern:'code is (?<otp>[0-9]{6})'});store.syncRule(rule);store.activate('p','LOGIN',1);
- const service=new Retrieval(store,{read:async()=>{appendFileSync(join(process.env.TEST_ROOT,'reads'),'read\\n');return[{ref:'fixture:restart',sender:'sender@example.test',subject:'code',body:'Your sign-in code is 001234',receivedAt:Math.floor(Date.now()/1000)}];},close:async()=>{}});
+ const rule=ruleSchema.parse({providerUid:'p',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'exact',subject:'code'});store.syncRule(rule);store.activate('p','LOGIN',1);
+ const llm={classify:async({messages,purpose})=>{const match=messages[0].body.match(/[0-9]{6}/);return match?{pick:1,kind:'CODE',value:match[0],purpose,reason:'stub'}:null;}};
+ const service=new Retrieval(store,{read:async()=>{appendFileSync(join(process.env.TEST_ROOT,'reads'),'read\\n');return[{ref:'fixture:restart',sender:'sender@example.test',subject:'code',body:'Your sign-in code is 001234',receivedAt:Math.floor(Date.now()/1000)}];},close:async()=>{}},undefined,undefined,undefined,undefined,llm);
  const server=createApp(service,process.env.TEST_TOKEN).listen(0,'127.0.0.1',()=>console.log(JSON.stringify({port:server.address().port})));`;
  const script=join(root,'host.mjs');writeFileSync(script,code);
  const start=async()=>{

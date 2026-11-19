@@ -1,16 +1,16 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { Lookup, Profile, Result, Rule, ServiceError } from './contracts.js';
+import { Lookup, Message, Profile, Result, Rule, ServiceError, senderAccepted } from './contracts.js';
 import { Store } from './store.js';
 import { Mailbox } from './browser.js';
 import { Executor } from './executor.js';
-import { extract } from './extraction.js';
+import { Classification, Classifier, Llm } from './llm.js';
 import { log, errorFields, withLogContext } from './log.js';
-import { MESSAGE_LOOKBACK_SECONDS } from './message.js';
+import { MESSAGE_LOOKBACK_SECONDS, MAX_CANDIDATE_MESSAGES } from './message.js';
 export class Retrieval {
   private running=new Map<string,{hash:string;promise:Promise<unknown>;controller:AbortController;waiters:number}>();
   private maintenance=new Set<{controller:AbortController;promise:Promise<unknown>}>();
   private subscribers=new Map<string,number>();
-  constructor(readonly store:Store,readonly mailbox:Mailbox,readonly executor=new Executor(),private pollMs=2000,readonly requireProfileProof=false,readonly allowSyntheticProof=false){}
+  constructor(readonly store:Store,readonly mailbox:Mailbox,readonly executor=new Executor(),private pollMs=2000,readonly requireProfileProof=false,readonly allowSyntheticProof=false,readonly llm:Classifier=new Llm()){}
   subscribe(uid:string){
     this.subscribers.set(uid,(this.subscribers.get(uid)||0)+1);let released=false;
     return(disconnected=false)=>{if(released)return;released=true;const left=(this.subscribers.get(uid)||1)-1;if(left)this.subscribers.set(uid,left);else{this.subscribers.delete(uid);if(disconnected){log('warn','lookup_client_disconnected',{attemptUid:uid});this.running.get(uid)?.controller.abort(new ServiceError(499,'CLIENT_DISCONNECTED'));}}};
@@ -54,6 +54,8 @@ export class Retrieval {
     const promise=Promise.resolve().then(()=>this.executor.run(profile.uid,input.lookupDeadlineAt*1000,controller.signal,async()=>{
       log('info','lookup_execution_started',{profileUid:profile.uid,...this.executor.stats()});
       let response:unknown;
+      // One call per distinct candidate set: an unchanged mailbox costs nothing on the next poll.
+      const classified=new Map<string,Classification|null>();
       const current=this.store.profile(input.targetEmail);
       if(!current?.enabled||!current.verified||current.uid!==profile.uid||current.revision!==profile.revision)throw new ServiceError(503,'PROFILE_CHANGED');
       this.store.cleanupPending(input.attemptUid,profile.uid);
@@ -63,24 +65,36 @@ export class Retrieval {
           const pollStarted=performance.now();polls++;
           log('debug','lookup_poll_started',{poll:polls,remainingMs:Math.max(0,input.lookupDeadlineAt*1000-Date.now())});
           const fetched=await this.mailbox.read(profile,input,rule,controller.signal);
+          // The newest matching mail wins: the request window only bounds when the customer asked, not when the provider sent the code.
           const messages=fetched.filter(m=>m.receivedAt>=Math.floor(Date.now()/1000)-MESSAGE_LOOKBACK_SECONDS&&m.receivedAt<=Math.floor(Date.now()/1000)).sort((a,b)=>b.receivedAt-a.receivedAt);
           log('info','lookup_poll_completed',{poll:polls,fetchedCount:fetched.length,messageCount:messages.length,outsideLookbackCount:fetched.length-messages.length,durationMs:Math.round(performance.now()-pollStarted)});
-          let result:Result|undefined,matchedSender='';let rejectedCount=0,skippedCount=0;
+          let result:Result|undefined,matchedSender='';let rejectedCount=0,skippedCount=0;const rejectedBy:Record<string,number>={};
+          // Expired and already-consumed mails never reach the model; the newest remaining ones do.
+          const candidates:Message[]=[];
           for(const message of messages){
-            if(result?.receivedAt!==undefined&&message.receivedAt<result.receivedAt)break;
             if(input.excludedSourceMessageRefs.includes(message.ref)||!diagnostic&&this.store.used(input.targetEmail,message.ref,input.attemptUid,Math.floor(Date.now()/1000))){skippedCount++;log('debug','lookup_message_skipped',{reason:'EXCLUDED_OR_ALREADY_USED',poll:polls});continue;}
-            const found=await extract(rule,message);
-            if(found.outcome==='NOT_FOUND'){rejectedCount++;continue;}
-            matchedSender=message.sender.toLowerCase();
-            if(found.outcome!=='FOUND'){result=found;break;}
-            // Distinct sources tied at the newest receipt time have no trustworthy ordering.
-            if(result){if(result.sourceMessageRef!==message.ref){result={outcome:'AMBIGUOUS'};break;}continue;}
-            if(message.purpose&&message.purpose!==input.purpose)throw new ServiceError(422,'PURPOSE_MISMATCH');
-            const fallback=input.otpValiditySeconds?message.receivedAt+input.otpValiditySeconds:0;
-            const expiresAt=message.expiresAt&&fallback?Math.min(message.expiresAt,fallback):message.expiresAt||fallback;
-            if(!expiresAt)throw new ServiceError(422,'EXPIRY_UNAVAILABLE');
-            if(expiresAt<=Math.floor(Date.now()/1000))throw new ServiceError(410,'OTP_EXPIRED');
-            result={...found,purpose:input.purpose,sourceMessageRef:message.ref,receivedAt:message.receivedAt,expiresAt,expirySource:message.expiresAt&&(!fallback||message.expiresAt<=fallback)?'EMAIL':'PROVIDER_POLICY'};
+            if(!senderAccepted(rule,message.sender)){rejectedCount++;rejectedBy.SENDER_MISMATCH=(rejectedBy.SENDER_MISMATCH||0)+1;continue;}
+            if(message.expiresAt!==undefined&&message.expiresAt<=Math.floor(Date.now()/1000)){rejectedCount++;rejectedBy.EXPIRED=(rejectedBy.EXPIRED||0)+1;continue;}
+            candidates.push(message);
+            if(candidates.length>=MAX_CANDIDATE_MESSAGES)break;
+          }
+          if(candidates.length){
+            const key=candidates.map(message=>message.ref).join('\n');
+            let answer=classified.get(key);
+            if(answer===undefined){
+              try{answer=await this.llm.classify({providerUid:input.providerUid,providerName:input.providerName,purpose:input.purpose,requestedAt:input.windowStartedAt,now:Math.floor(Date.now()/1000),messages:candidates});}
+              catch(error){answer=undefined;log('warn','llm_classification_failed',{poll:polls,...errorFields(error)});}
+              if(answer!==undefined)classified.set(key,answer);
+            }
+            if(answer){
+              const message=candidates[answer.pick-1];
+              matchedSender=message.sender.toLowerCase();
+              const fallback=input.otpValiditySeconds?message.receivedAt+input.otpValiditySeconds:0;
+              const expiresAt=message.expiresAt&&fallback?Math.min(message.expiresAt,fallback):message.expiresAt||fallback;
+              if(!expiresAt)throw new ServiceError(422,'EXPIRY_UNAVAILABLE');
+              if(expiresAt<=Math.floor(Date.now()/1000))throw new ServiceError(410,'OTP_EXPIRED');
+              result={outcome:'FOUND',code:answer.value,purpose:input.purpose,sourceMessageRef:message.ref,receivedAt:message.receivedAt,expiresAt,expirySource:message.expiresAt&&(!fallback||message.expiresAt<=fallback)?'EMAIL':'PROVIDER_POLICY'};
+            }
           }
           if(result){
             log('info','lookup_candidate_selected',{outcome:result.outcome,poll:polls,receivedAt:result.receivedAt,expiresAt:result.expiresAt,expirySource:result.expirySource});
@@ -94,7 +108,7 @@ export class Retrieval {
             log('info','lookup_result_persisted',{outcome:result.outcome,sourceReserved:!diagnostic&&result.outcome==='FOUND'});
             break;
           }
-          log('info','lookup_waiting_for_mail',{poll:polls,rejectedCount,skippedCount,remainingMs:Math.max(0,input.lookupDeadlineAt*1000-Date.now())});
+          log('info','lookup_waiting_for_mail',{poll:polls,rejectedCount,skippedCount,rejectedBy:Object.entries(rejectedBy).map(([reason,count])=>`${reason}:${count}`).join('|')||undefined,remainingMs:Math.max(0,input.lookupDeadlineAt*1000-Date.now())});
           await delay(Math.min(this.pollMs,Math.max(1,input.lookupDeadlineAt*1000-Date.now()-50)),undefined,{signal:controller.signal});
         }
         if(!response)throw new ServiceError(504,'TIMEOUT');

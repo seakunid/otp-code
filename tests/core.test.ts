@@ -5,27 +5,25 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { Store } from '../src/store.js';
-import { extract } from '../src/extraction.js';
-import { ruleSchema, lookupSchema, Message, Profile } from '../src/contracts.js';
+import { ruleSchema, lookupSchema, senderAccepted } from '../src/contracts.js';
 import { Retrieval } from '../src/service.js';
 import { createApp } from '../src/app.js';
 import { Executor } from '../src/executor.js';
+import { stubClassifier } from './helpers/classifier.js';
 const token='synthetic-test-bearer-0123456789';
-const rule=ruleSchema.parse({providerUid:'provider',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code',purposeMarkers:['code'],pattern:'(?:code(?: is|:)?\\s*)(?<otp>[0-9]{4,8})'});
+const rule=ruleSchema.parse({providerUid:'provider',purpose:'LOGIN',version:1,senders:['sender@example.test'],subjectMode:'contains',subject:'code'});
 const input=()=>lookupSchema.parse({requestUid:'request',attemptUid:'attempt',providerUid:'provider',accountUid:'account',targetEmail:'target@example.test',purpose:'LOGIN',ruleVersion:1,windowStartedAt:Math.floor(Date.now()/1000)-60,lookupDeadlineAt:Math.floor(Date.now()/1000)+30,otpValiditySeconds:600});
 function fixture(receivedAt=Math.floor(Date.now()/1000)){
  const path=mkdtempSync(join(tmpdir(),'otp-test-'));const key=randomBytes(32);const store=new Store(join(path,'state.sqlite'),key);store.createProfile('target@example.test',join(path,'profile'));store.enable(store.profile('target@example.test')!.uid);store.syncRule(rule);store.activate('provider','LOGIN',1);
  let reads=0,closes=0;
  const mailbox={read:async()=>{reads++;return[{ref:'message',sender:'sender@example.test',subject:'code',body:'Your code is 0738',receivedAt}];},close:async()=>{closes++;}};
- const service=new Retrieval(store,mailbox,new Executor(),5);
+ const service=new Retrieval(store,mailbox,new Executor(),5,false,false,stubClassifier());
  return {store,service,path,key,get reads(){return reads;},get closes(){return closes;}};
 }
-test('parser preserves zero, rejects ambiguity, sender spoof and quoted code',async()=>{
- const m:Message={ref:'x',sender:'sender@example.test',subject:'code',body:'Your code is 0738',receivedAt:1};
- assert.equal((await extract(rule,m)).code,'0738');
- assert.equal((await extract(rule,{...m,body:'code is 0738 and code is 5481'})).outcome,'AMBIGUOUS');
- assert.equal((await extract(rule,{...m,sender:'sender@example.test.attacker.test'})).outcome,'NOT_FOUND');
- assert.equal((await extract(rule,{...m,body:'Hello\n----- Previous message -----\ncode is 0738'})).outcome,'NOT_FOUND');
+test('sender scope accepts exact senders and parent domains but never lookalikes',()=>{
+ const scope={senders:['Sender@EXAMPLE.TEST'],domains:['example.test']};
+ for(const sender of ['sender@example.test','sender@tm.example.test','sender@em7877.tm.example.test'])assert.equal(senderAccepted(scope,sender),true,sender);
+ for(const sender of ['sender@example.test.attacker.test','sender@notexample.test','sender@examp1e.test'])assert.equal(senderAccepted(scope,sender),false,sender);
 });
 test('HTTP auth, strict input, found closes browser, replay and conflicts',async(t)=>{
  const f=fixture();const server=createApp(f.service,token).listen(0,'127.0.0.1');await new Promise<void>(r=>server.once('listening',r));const addr=server.address() as {port:number};const base=`http://127.0.0.1:${addr.port}`;

@@ -19,19 +19,22 @@ export const cancelSchema = z.object({
   lookupDeadlineAt:z.number().int().positive(),commandUid:z.string().min(1).max(128),reason:z.enum(['MANUAL_OVERRIDE','DONE','CANCELLED','SUPERSEDED'])
 }).strict();
 export type Cancellation = z.infer<typeof cancelSchema>;
+const domainList = z.array(z.string().regex(/^[a-z0-9.-]+$/i)).max(50);
+// Scope only: the model picks the mail and the artifact. Unknown keys are stripped, so older revisions still parse.
 export const ruleSchema = z.object({
   providerUid: z.string().min(1).max(128), purpose, version: z.number().int().positive(),
-  senders: z.array(z.email()).max(50).default([]), domains: z.array(z.string().regex(/^[a-z0-9.-]+$/i)).max(50).default([]),
-  subjectMode: z.enum(['exact', 'contains']), subject: z.string().min(1).max(500),
-  purposeMarkers: z.array(z.string().min(2).max(100)).min(1).max(20),
-  pattern: z.string().min(1).max(2000), flags: z.string().regex(/^[imu]*$/).default('i'),
-  source: z.enum(['body', 'subject', 'both']).default('body'),
-  stripSpaces: z.boolean().default(false), stripHyphens: z.boolean().default(false),
-  minLength: z.number().int().min(1).max(32).default(4), maxLength: z.number().int().min(1).max(32).default(32)
-}).strict().refine(r => r.senders.length + r.domains.length > 0, 'Sender rule required')
-  .refine(r => r.minLength <= r.maxLength, 'Invalid code length');
+  senders: z.array(z.email()).max(50).default([]),
+  // Parent domain: `openai.com` also matches `tm.openai.com`. Exact From hosts belong in `senders`.
+  domains: domainList.default([]),
+  subjectMode: z.enum(['exact', 'contains']), subject: z.string().max(500).default('')
+}).refine(r => r.senders.length + r.domains.length > 0, 'Sender rule required');
 export type Rule = z.infer<typeof ruleSchema>;
-export type Message = {ref: string; sender: string; subject: string; body: string; receivedAt: number; purpose?: string; expiresAt?: number};
-export type Result = {outcome: 'FOUND'|'NOT_FOUND'|'AMBIGUOUS'|'SECURITY_ALERT'|'EMAIL_NOT_FOUND'; code?: string; sourceMessageRef?: string; receivedAt?: number; expiresAt?: number; expirySource?:string; purpose?: string};
+// The dot keeps `notopenai.com` out of `openai.com`; an exact sender wins over any domain.
+export const senderAccepted=(rule:Pick<Rule,'senders'|'domains'>,sender:string)=>{
+  const value=sender.trim().toLowerCase(),domain=value.split('@')[1]||'';
+  return rule.senders.some(x=>x.toLowerCase()===value)||rule.domains.some(d=>{const host=d.toLowerCase();return domain===host||domain.endsWith('.'+host);});
+};
+export type Message = {ref: string; sender: string; subject: string; body: string; links?: string; receivedAt: number; purpose?: string; expiresAt?: number};
+export type Result = {outcome: 'FOUND'|'NOT_FOUND'|'AMBIGUOUS'|'SECURITY_ALERT'|'EMAIL_NOT_FOUND'; code?: string; sourceMessageRef?: string; receivedAt?: number; expiresAt?: number; expirySource?:string; purpose?: string; reason?: string};
 export type Profile = {uid: string; email: string; directory: string; enabled: number; verified: number; revision: number};
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
